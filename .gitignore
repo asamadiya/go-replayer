@@ -1,0 +1,17 @@
+# Go build artifacts
+dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local binaries
+/grpc-replayer
+/grpc-dummy-target
+/grpc-gap-target
+/cmd/grpc-parity-check/grpc-parity-check
+
+# IDE
+.vscode/
+.idea/
+/bin/
