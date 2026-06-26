@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
@@ -86,6 +87,13 @@ func TestScheduler_ReplicasAllowFractionalPerReplicaRate(t *testing.T) {
 	}
 	if got := s.PerReplicaBaseRate(); got < 3.333 || got > 3.334 {
 		t.Fatalf("expected fractional per-replica rate around 3.333, got %v", got)
+	}
+}
+
+func TestPoissonIntervalFloat_ClampsOverflow(t *testing.T) {
+	got := poissonIntervalFloat(math.SmallestNonzeroFloat64, rand.New(rand.NewSource(1)))
+	if got != time.Duration(1<<63-1) {
+		t.Fatalf("expected max duration clamp, got %v", got)
 	}
 }
 

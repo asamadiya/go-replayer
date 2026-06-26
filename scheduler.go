@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"fmt"
 	"math"
 	"math/rand"
@@ -130,7 +131,7 @@ type Scheduler struct {
 	rng      *rand.Rand
 
 	// Internal state.
-	poissonStreams   []poissonStream
+	poissonStreams   poissonHeap
 	nextBurstOnset   time.Time
 	burstSched       bool
 	pendingSpikes    []time.Time // sorted ascending
@@ -153,7 +154,26 @@ type Scheduler struct {
 type poissonStream struct {
 	rate float64
 	next time.Time
-	have bool
+}
+
+type poissonHeap []poissonStream
+
+func (h poissonHeap) Len() int { return len(h) }
+
+func (h poissonHeap) Less(i, j int) bool { return h[i].next.Before(h[j].next) }
+
+func (h poissonHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *poissonHeap) Push(x any) {
+	*h = append(*h, x.(poissonStream))
+}
+
+func (h *poissonHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 // NewScheduler builds a Scheduler. targetQPS is the user's --qps; the
@@ -188,8 +208,12 @@ func NewSchedulerWithReplicas(targetQPS int, replicas int, cfg BurstConfig, star
 		perReplicaRate := float64(base) / float64(replicas)
 		s.poissonStreams = make([]poissonStream, replicas)
 		for i := range s.poissonStreams {
-			s.poissonStreams[i] = poissonStream{rate: perReplicaRate, next: start}
+			s.poissonStreams[i] = poissonStream{
+				rate: perReplicaRate,
+				next: start.Add(poissonIntervalFloat(perReplicaRate, s.rng)),
+			}
 		}
+		heap.Init(&s.poissonStreams)
 	}
 	if cfg.Enabled() {
 		s.nextBurstOnset = start.Add(cfg.Period)
@@ -223,18 +247,8 @@ func (s *Scheduler) PerReplicaBaseRate() float64 {
 // are then zero values.
 func (s *Scheduler) Next() (time.Time, ArrivalKind, bool) {
 	for {
-		// Generate one pending Poisson candidate per replica.
-		for i := range s.poissonStreams {
-			if !s.poissonStreams[i].have {
-				s.poissonStreams[i].next = s.poissonStreams[i].next.Add(
-					poissonIntervalFloat(s.poissonStreams[i].rate, s.rng),
-				)
-				s.poissonStreams[i].have = true
-			}
-		}
-
 		// Pick the earliest of {next poisson, next burst onset, head of spikes}.
-		nextKind, nextTime, replica := s.peekEarliest()
+		nextKind, nextTime := s.peekEarliest()
 		if nextKind == evNone {
 			return time.Time{}, ArrivalBase, false
 		}
@@ -253,7 +267,9 @@ func (s *Scheduler) Next() (time.Time, ArrivalKind, bool) {
 			atomic.AddInt64(&s.spikesLatch, 1)
 			return nextTime, ArrivalSpike, true
 		case evPoisson:
-			s.poissonStreams[replica].have = false
+			stream := heap.Pop(&s.poissonStreams).(poissonStream)
+			stream.next = stream.next.Add(poissonIntervalFloat(stream.rate, s.rng))
+			heap.Push(&s.poissonStreams, stream)
 			atomic.AddInt64(&s.baseFired, 1)
 			atomic.AddInt64(&s.baseLatch, 1)
 			return nextTime, ArrivalBase, true
@@ -271,16 +287,13 @@ const (
 )
 
 // peekEarliest returns the next pending event without advancing state.
-func (s *Scheduler) peekEarliest() (schedulerEvent, time.Time, int) {
+func (s *Scheduler) peekEarliest() (schedulerEvent, time.Time) {
 	var (
 		bestKind schedulerEvent = evNone
 		bestTime time.Time
-		replica  int
 	)
-	for i, stream := range s.poissonStreams {
-		if stream.have && (bestKind == evNone || stream.next.Before(bestTime)) {
-			bestKind, bestTime, replica = evPoisson, stream.next, i
-		}
+	if len(s.poissonStreams) > 0 {
+		bestKind, bestTime = evPoisson, s.poissonStreams[0].next
 	}
 	if len(s.pendingSpikes) > 0 {
 		t := s.pendingSpikes[0]
@@ -294,7 +307,7 @@ func (s *Scheduler) peekEarliest() (schedulerEvent, time.Time, int) {
 			bestKind, bestTime = evBurstOnset, t
 		}
 	}
-	return bestKind, bestTime, replica
+	return bestKind, bestTime
 }
 
 // spawnBurst materialises s.burst.Size spike timestamps, ordered, into

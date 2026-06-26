@@ -58,7 +58,7 @@ Key behavior:
 
 #### Replica Poisson streams
 
-Use `--replicas R` to model traffic coming from `R` independent upstream replicas. The sender keeps `--qps` as the aggregate target and splits it equally across replicas, so `--qps 300 --replicas 30` runs 30 independent Poisson streams at 10 QPS each.
+Use `--replicas R` to model traffic coming from `R` independent upstream replicas (maximum 10000). The sender keeps `--qps` as the aggregate target and splits it equally across replicas, so `--qps 300 --replicas 30` runs 30 independent Poisson streams at 10 QPS each.
 
 ```bash
 ./bin/go-replayer \

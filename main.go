@@ -28,6 +28,7 @@ import (
 )
 
 const defaultMethod = "/example.replay.v1.ReplayService/Score"
+const maxReplicas = 10000
 
 var (
 	takeoverInstallRootCandidates = []string{
@@ -324,7 +325,11 @@ func poissonIntervalFloat(rate float64, rng *rand.Rand) time.Duration {
 		u = math.SmallestNonzeroFloat64
 	}
 	seconds := -math.Log(u) / rate
-	return time.Duration(seconds * float64(time.Second))
+	nanos := seconds * float64(time.Second)
+	if math.IsInf(nanos, 0) || nanos >= float64(time.Duration(1<<63-1)) {
+		return time.Duration(1<<63 - 1)
+	}
+	return time.Duration(nanos)
 }
 
 func stripBalancedWrappers(input string) string {
@@ -403,7 +408,7 @@ func main() {
 	filePath := flag.String("file", "", "Path to binary file of length-prefixed protobuf requests")
 	target := flag.String("target", "", "gRPC target host:port or tuple (host,port) (required, including takeover mode)")
 	qps := flag.Int("qps", 10, "Target queries per second (Poisson arrival rate)")
-	replicas := flag.Int("replicas", 1, "Concurrent upstream replicas; total --qps is split equally across independent Poisson streams")
+	replicas := flag.Int("replicas", 1, fmt.Sprintf("Concurrent upstream replicas; total --qps is split equally across independent Poisson streams (max %d)", maxReplicas))
 	duration := flag.Duration("duration", time.Minute, "How long to replay")
 	method := flag.String("method", defaultMethod, "Full gRPC method path")
 	useTLS := flag.Bool("tls", true, "Use TLS for gRPC connection")
@@ -518,6 +523,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ERROR: --replicas must be > 0")
 		os.Exit(1)
 	}
+	if *replicas > maxReplicas {
+		fmt.Fprintf(os.Stderr, "ERROR: --replicas must be <= %d\n", maxReplicas)
+		os.Exit(1)
+	}
 	if *duration <= 0 {
 		fmt.Fprintln(os.Stderr, "ERROR: --duration must be > 0")
 		os.Exit(1)
@@ -609,7 +618,7 @@ func main() {
 		*certFile != "",
 	)
 	fmt.Printf(
-		"Replaying at %d QPS for %s using method %s (replicas=%d per_replica_qps=%.3f)\n\n",
+		"Replaying at %d QPS for %s using method %s (replicas=%d per_replica_target_qps=%.3f)\n\n",
 		*qps,
 		*duration,
 		*method,
@@ -751,25 +760,25 @@ func main() {
 					)
 				}
 				jsonl.WriteTick(EmitTick{
-					TS:             time.Now(),
-					Sec:            sec,
-					TargetQPS:      *qps,
-					Replicas:       scheduler.Replicas(),
-					PerReplicaQPS:  scheduler.PerReplicaBaseRate(),
-					Sent:           s,
-					OK:             o,
-					Err:            e,
-					Drift:          sendDrift,
-					P50:            p50,
-					P90:            p90,
-					P99:            p99,
-					Inflight:       inflightSnapshot,
-					Queue:          queueLen,
-					SchedBlockedMs: schedBlockedMs,
-					SchedLagMs:     schedLagMs,
-					BurstsFired:    schedCounters.BurstsFired,
-					SpikesFired:    schedCounters.SpikesFired,
-					BaseFired:      schedCounters.BaseFired,
+					TS:                time.Now(),
+					Sec:               sec,
+					TargetQPS:         *qps,
+					Replicas:          scheduler.Replicas(),
+					PerReplicaBaseQPS: scheduler.PerReplicaBaseRate(),
+					Sent:              s,
+					OK:                o,
+					Err:               e,
+					Drift:             sendDrift,
+					P50:               p50,
+					P90:               p90,
+					P99:               p99,
+					Inflight:          inflightSnapshot,
+					Queue:             queueLen,
+					SchedBlockedMs:    schedBlockedMs,
+					SchedLagMs:        schedLagMs,
+					BurstsFired:       schedCounters.BurstsFired,
+					SpikesFired:       schedCounters.SpikesFired,
+					BaseFired:         schedCounters.BaseFired,
 				})
 			case <-reporterStop:
 				return
