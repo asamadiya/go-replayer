@@ -312,6 +312,10 @@ func buildDialOptions(useTLS bool, insecureSkip bool, certFile string, keyFile s
 }
 
 func poissonInterval(rate int, rng *rand.Rand) time.Duration {
+	return poissonIntervalFloat(float64(rate), rng)
+}
+
+func poissonIntervalFloat(rate float64, rng *rand.Rand) time.Duration {
 	if rate <= 0 {
 		return 0
 	}
@@ -319,7 +323,7 @@ func poissonInterval(rate int, rng *rand.Rand) time.Duration {
 	if u <= 0 {
 		u = math.SmallestNonzeroFloat64
 	}
-	seconds := -math.Log(u) / float64(rate)
+	seconds := -math.Log(u) / rate
 	return time.Duration(seconds * float64(time.Second))
 }
 
@@ -399,6 +403,7 @@ func main() {
 	filePath := flag.String("file", "", "Path to binary file of length-prefixed protobuf requests")
 	target := flag.String("target", "", "gRPC target host:port or tuple (host,port) (required, including takeover mode)")
 	qps := flag.Int("qps", 10, "Target queries per second (Poisson arrival rate)")
+	replicas := flag.Int("replicas", 1, "Concurrent upstream replicas; total --qps is split equally across independent Poisson streams")
 	duration := flag.Duration("duration", time.Minute, "How long to replay")
 	method := flag.String("method", defaultMethod, "Full gRPC method path")
 	useTLS := flag.Bool("tls", true, "Use TLS for gRPC connection")
@@ -509,6 +514,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ERROR: --qps must be > 0")
 		os.Exit(1)
 	}
+	if *replicas <= 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: --replicas must be > 0")
+		os.Exit(1)
+	}
 	if *duration <= 0 {
 		fmt.Fprintln(os.Stderr, "ERROR: --duration must be > 0")
 		os.Exit(1)
@@ -599,7 +608,14 @@ func main() {
 		*insecureSkip,
 		*certFile != "",
 	)
-	fmt.Printf("Replaying at %d QPS for %s using method %s\n\n", *qps, *duration, *method)
+	fmt.Printf(
+		"Replaying at %d QPS for %s using method %s (replicas=%d per_replica_qps=%.3f)\n\n",
+		*qps,
+		*duration,
+		*method,
+		*replicas,
+		float64(*qps)/float64(*replicas),
+	)
 
 	var (
 		totalSent             int64
@@ -643,7 +659,7 @@ func main() {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	scheduleStart := time.Now()
 	replayDeadline := scheduleStart.Add(*duration)
-	scheduler := NewScheduler(*qps, burstCfg, scheduleStart, replayDeadline, rng)
+	scheduler := NewSchedulerWithReplicas(*qps, *replicas, burstCfg, scheduleStart, replayDeadline, rng)
 	scheduler.OnBurstSpawned = func(at time.Time, cfg BurstConfig) {
 		jsonl.WriteBurstEvent(at, cfg)
 	}
@@ -651,8 +667,10 @@ func main() {
 
 	if burstCfg.Enabled() {
 		fmt.Printf(
-			"Bursts enabled: %s (effective_base_qps=%d)\n",
+			"Bursts enabled: %s (effective_base_qps=%d replicas=%d per_replica_base_qps=%.3f)\n",
 			burstCfg, scheduler.EffectiveBaseRate(),
+			scheduler.Replicas(),
+			scheduler.PerReplicaBaseRate(),
 		)
 	}
 
@@ -736,6 +754,8 @@ func main() {
 					TS:             time.Now(),
 					Sec:            sec,
 					TargetQPS:      *qps,
+					Replicas:       scheduler.Replicas(),
+					PerReplicaQPS:  scheduler.PerReplicaBaseRate(),
 					Sent:           s,
 					OK:             o,
 					Err:            e,
@@ -908,19 +928,21 @@ func main() {
 
 	schedTotals := scheduler.SnapshotCounters()
 	summaryRow := map[string]any{
-		"target_qps":             *qps,
-		"effective_base_qps":     scheduler.EffectiveBaseRate(),
-		"duration":               elapsed.Round(time.Second).String(),
-		"total_sent":             total,
-		"total_ok":               ok,
-		"total_err":              errCount,
-		"achieved_send_qps":      float64(total) / elapsed.Seconds(),
-		"achieved_ok_qps":        float64(ok) / elapsed.Seconds(),
-		"bursts_fired":           schedTotals.BurstsFired,
-		"spikes_fired":           schedTotals.SpikesFired,
-		"base_fired":             schedTotals.BaseFired,
-		"burst_config":           burstCfg.String(),
-		"window_summary":         windowSummary,
+		"target_qps":           *qps,
+		"replicas":             scheduler.Replicas(),
+		"per_replica_base_qps": scheduler.PerReplicaBaseRate(),
+		"effective_base_qps":   scheduler.EffectiveBaseRate(),
+		"duration":             elapsed.Round(time.Second).String(),
+		"total_sent":           total,
+		"total_ok":             ok,
+		"total_err":            errCount,
+		"achieved_send_qps":    float64(total) / elapsed.Seconds(),
+		"achieved_ok_qps":      float64(ok) / elapsed.Seconds(),
+		"bursts_fired":         schedTotals.BurstsFired,
+		"spikes_fired":         schedTotals.SpikesFired,
+		"base_fired":           schedTotals.BaseFired,
+		"burst_config":         burstCfg.String(),
+		"window_summary":       windowSummary,
 	}
 	if len(all) > 0 {
 		summaryRow["latency_ms"] = map[string]float64{

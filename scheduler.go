@@ -124,25 +124,25 @@ func (c BurstConfig) String() string {
 // swap-and-read them concurrently for live telemetry.
 type Scheduler struct {
 	baseRate int
+	replicas int
 	burst    BurstConfig
 	deadline time.Time
 	rng      *rand.Rand
 
 	// Internal state.
-	nextPoisson      time.Time
-	havePoisson      bool
+	poissonStreams   []poissonStream
 	nextBurstOnset   time.Time
 	burstSched       bool
 	pendingSpikes    []time.Time // sorted ascending
 	pendingSpikesCap int
 
 	// Counters (atomic — readable from any goroutine).
-	burstsFired  int64
-	spikesFired  int64
-	baseFired    int64
-	burstsLatch  int64
-	spikesLatch  int64
-	baseLatch    int64
+	burstsFired int64
+	spikesFired int64
+	baseFired   int64
+	burstsLatch int64
+	spikesLatch int64
+	baseLatch   int64
 
 	// OnBurstSpawned, if non-nil, is invoked synchronously when a burst is
 	// materialised — typically called from the same goroutine that drives
@@ -150,10 +150,25 @@ type Scheduler struct {
 	OnBurstSpawned func(at time.Time, cfg BurstConfig)
 }
 
+type poissonStream struct {
+	rate float64
+	next time.Time
+	have bool
+}
+
 // NewScheduler builds a Scheduler. targetQPS is the user's --qps; the
 // scheduler will internally reduce the Poisson base if cfg.Mode is
 // BurstAbsorbing so that the long-run mean equals targetQPS.
 func NewScheduler(targetQPS int, cfg BurstConfig, start, deadline time.Time, rng *rand.Rand) *Scheduler {
+	return NewSchedulerWithReplicas(targetQPS, 1, cfg, start, deadline, rng)
+}
+
+// NewSchedulerWithReplicas builds a Scheduler with replicas independent
+// Poisson streams. The effective base QPS is spread equally across streams.
+func NewSchedulerWithReplicas(targetQPS int, replicas int, cfg BurstConfig, start, deadline time.Time, rng *rand.Rand) *Scheduler {
+	if replicas < 1 {
+		replicas = 1
+	}
 	base := targetQPS
 	if cfg.Enabled() && cfg.Mode == BurstAbsorbing {
 		burstQPS := cfg.AvgQPS()
@@ -163,11 +178,18 @@ func NewScheduler(targetQPS int, cfg BurstConfig, start, deadline time.Time, rng
 		}
 	}
 	s := &Scheduler{
-		baseRate:    base,
-		burst:       cfg,
-		deadline:    deadline,
-		rng:         rng,
-		nextPoisson: start,
+		baseRate: base,
+		replicas: replicas,
+		burst:    cfg,
+		deadline: deadline,
+		rng:      rng,
+	}
+	if base > 0 {
+		perReplicaRate := float64(base) / float64(replicas)
+		s.poissonStreams = make([]poissonStream, replicas)
+		for i := range s.poissonStreams {
+			s.poissonStreams[i] = poissonStream{rate: perReplicaRate, next: start}
+		}
 	}
 	if cfg.Enabled() {
 		s.nextBurstOnset = start.Add(cfg.Period)
@@ -185,19 +207,34 @@ func NewScheduler(targetQPS int, cfg BurstConfig, start, deadline time.Time, rng
 // In absorbing mode this is reduced from the user's --qps.
 func (s *Scheduler) EffectiveBaseRate() int { return s.baseRate }
 
+// Replicas returns the number of independent Poisson streams.
+func (s *Scheduler) Replicas() int { return s.replicas }
+
+// PerReplicaBaseRate returns the base Poisson λ assigned to each replica.
+func (s *Scheduler) PerReplicaBaseRate() float64 {
+	if s.replicas <= 0 {
+		return 0
+	}
+	return float64(s.baseRate) / float64(s.replicas)
+}
+
 // Next returns the next scheduled arrival before the deadline.
 // The bool is false when the schedule is exhausted; the time and kind
 // are then zero values.
 func (s *Scheduler) Next() (time.Time, ArrivalKind, bool) {
 	for {
-		// Generate a Poisson candidate if one isn't already pending.
-		if !s.havePoisson && s.baseRate > 0 {
-			s.nextPoisson = s.nextPoisson.Add(poissonInterval(s.baseRate, s.rng))
-			s.havePoisson = true
+		// Generate one pending Poisson candidate per replica.
+		for i := range s.poissonStreams {
+			if !s.poissonStreams[i].have {
+				s.poissonStreams[i].next = s.poissonStreams[i].next.Add(
+					poissonIntervalFloat(s.poissonStreams[i].rate, s.rng),
+				)
+				s.poissonStreams[i].have = true
+			}
 		}
 
 		// Pick the earliest of {next poisson, next burst onset, head of spikes}.
-		nextKind, nextTime := s.peekEarliest()
+		nextKind, nextTime, replica := s.peekEarliest()
 		if nextKind == evNone {
 			return time.Time{}, ArrivalBase, false
 		}
@@ -216,7 +253,7 @@ func (s *Scheduler) Next() (time.Time, ArrivalKind, bool) {
 			atomic.AddInt64(&s.spikesLatch, 1)
 			return nextTime, ArrivalSpike, true
 		case evPoisson:
-			s.havePoisson = false
+			s.poissonStreams[replica].have = false
 			atomic.AddInt64(&s.baseFired, 1)
 			atomic.AddInt64(&s.baseLatch, 1)
 			return nextTime, ArrivalBase, true
@@ -234,13 +271,16 @@ const (
 )
 
 // peekEarliest returns the next pending event without advancing state.
-func (s *Scheduler) peekEarliest() (schedulerEvent, time.Time) {
+func (s *Scheduler) peekEarliest() (schedulerEvent, time.Time, int) {
 	var (
 		bestKind schedulerEvent = evNone
 		bestTime time.Time
+		replica  int
 	)
-	if s.havePoisson {
-		bestKind, bestTime = evPoisson, s.nextPoisson
+	for i, stream := range s.poissonStreams {
+		if stream.have && (bestKind == evNone || stream.next.Before(bestTime)) {
+			bestKind, bestTime, replica = evPoisson, stream.next, i
+		}
 	}
 	if len(s.pendingSpikes) > 0 {
 		t := s.pendingSpikes[0]
@@ -254,7 +294,7 @@ func (s *Scheduler) peekEarliest() (schedulerEvent, time.Time) {
 			bestKind, bestTime = evBurstOnset, t
 		}
 	}
-	return bestKind, bestTime
+	return bestKind, bestTime, replica
 }
 
 // spawnBurst materialises s.burst.Size spike timestamps, ordered, into
