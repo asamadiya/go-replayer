@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
@@ -43,6 +44,56 @@ func TestScheduler_PoissonOnly_ApproxRate(t *testing.T) {
 	// Mean QPS = 100 over 10s → expected 1000 events. Allow generous noise.
 	if len(times) < 850 || len(times) > 1150 {
 		t.Errorf("expected ~1000 events, got %d", len(times))
+	}
+}
+
+func TestScheduler_ReplicasSplitRateAndPreserveAggregateQPS(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	start := time.Unix(0, 0)
+	deadline := start.Add(60 * time.Second)
+	s := NewSchedulerWithReplicas(300, 30, BurstConfig{}, start, deadline, rng)
+	if s.Replicas() != 30 {
+		t.Fatalf("expected 30 replicas, got %d", s.Replicas())
+	}
+	if s.EffectiveBaseRate() != 300 {
+		t.Fatalf("expected aggregate base rate 300, got %d", s.EffectiveBaseRate())
+	}
+	if got := s.PerReplicaBaseRate(); got != 10 {
+		t.Fatalf("expected per-replica base rate 10, got %v", got)
+	}
+	times, kinds := drainScheduler(t, s)
+	for _, k := range kinds {
+		if k != ArrivalBase {
+			t.Fatalf("expected only base arrivals, saw %v", k)
+		}
+	}
+	// Mean QPS = 300 over 60s → expected 18000 events. Allow Poisson noise.
+	if len(times) < 17400 || len(times) > 18600 {
+		t.Errorf("expected ~18000 events, got %d", len(times))
+	}
+}
+
+func TestScheduler_ReplicasAllowFractionalPerReplicaRate(t *testing.T) {
+	s := NewSchedulerWithReplicas(
+		100,
+		30,
+		BurstConfig{},
+		time.Unix(0, 0),
+		time.Unix(0, 0).Add(time.Second),
+		rand.New(rand.NewSource(19)),
+	)
+	if s.Replicas() != 30 {
+		t.Fatalf("expected 30 replicas, got %d", s.Replicas())
+	}
+	if got := s.PerReplicaBaseRate(); got < 3.333 || got > 3.334 {
+		t.Fatalf("expected fractional per-replica rate around 3.333, got %v", got)
+	}
+}
+
+func TestPoissonIntervalFloat_ClampsOverflow(t *testing.T) {
+	got := poissonIntervalFloat(math.SmallestNonzeroFloat64, rand.New(rand.NewSource(1)))
+	if got != time.Duration(1<<63-1) {
+		t.Fatalf("expected max duration clamp, got %v", got)
 	}
 }
 

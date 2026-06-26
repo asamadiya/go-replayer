@@ -50,18 +50,18 @@ func (a *WindowAnalyzer) Snapshot() []int64 {
 
 // WindowSummary captures per-window burstiness statistics.
 type WindowSummary struct {
-	Window           time.Duration `json:"window"`
-	NumBins          int           `json:"num_bins"`
-	NumEvents        int           `json:"num_events"`
-	DurationSec      float64       `json:"duration_sec"`
-	ObservedQPS      float64       `json:"observed_qps"`
-	MeanCount        float64       `json:"mean_count"`
-	VarCount         float64       `json:"var_count"`
-	Fano             float64       `json:"fano"`        // Var/Mean — Poisson ideal ≈ 1.0
-	Max              int           `json:"max"`         // largest count in any bin
-	P50              int           `json:"p50"`         // bin-count quantiles
-	P90              int           `json:"p90"`
-	P99              int           `json:"p99"`
+	Window           time.Duration  `json:"window"`
+	NumBins          int            `json:"num_bins"`
+	NumEvents        int            `json:"num_events"`
+	DurationSec      float64        `json:"duration_sec"`
+	ObservedQPS      float64        `json:"observed_qps"`
+	MeanCount        float64        `json:"mean_count"`
+	VarCount         float64        `json:"var_count"`
+	Fano             float64        `json:"fano"` // Var/Mean — Poisson ideal ≈ 1.0
+	Max              int            `json:"max"`  // largest count in any bin
+	P50              int            `json:"p50"`  // bin-count quantiles
+	P90              int            `json:"p90"`
+	P99              int            `json:"p99"`
 	ThresholdCrosses []ThresholdHit `json:"threshold_crosses"`
 }
 
@@ -251,23 +251,25 @@ func (j *JSONLWriter) Emit(row map[string]any) {
 
 // EmitTick is the canonical per-second telemetry row.
 type EmitTick struct {
-	TS              time.Time
-	Sec             int
-	TargetQPS       int
-	Sent            int64
-	OK              int64
-	Err             int64
-	Drift           float64
-	P50             float64
-	P90             float64
-	P99             float64
-	Inflight        int64
-	Queue           int
-	SchedBlockedMs  float64
-	SchedLagMs      float64
-	BurstsFired     int64
-	SpikesFired     int64
-	BaseFired       int64
+	TS                time.Time
+	Sec               int
+	TargetQPS         int
+	Replicas          int
+	PerReplicaBaseQPS float64
+	Sent              int64
+	OK                int64
+	Err               int64
+	Drift             float64
+	P50               float64
+	P90               float64
+	P99               float64
+	Inflight          int64
+	Queue             int
+	SchedBlockedMs    float64
+	SchedLagMs        float64
+	BurstsFired       int64
+	SpikesFired       int64
+	BaseFired         int64
 }
 
 // Write encodes the tick into JSONL.
@@ -276,24 +278,26 @@ func (j *JSONLWriter) WriteTick(t EmitTick) {
 		return
 	}
 	j.Emit(map[string]any{
-		"event":              "tick",
-		"ts":                 t.TS.UTC().Format(time.RFC3339Nano),
-		"sec":                t.Sec,
-		"target_qps":         t.TargetQPS,
-		"sent":               t.Sent,
-		"ok":                 t.OK,
-		"err":                t.Err,
-		"drift":              t.Drift,
-		"p50_ms":             t.P50,
-		"p90_ms":             t.P90,
-		"p99_ms":             t.P99,
-		"inflight":           t.Inflight,
-		"queue":              t.Queue,
-		"sched_blocked_ms":   t.SchedBlockedMs,
-		"sched_lag_ms":       t.SchedLagMs,
-		"bursts_fired":       t.BurstsFired,
-		"spikes_fired":       t.SpikesFired,
-		"base_fired":         t.BaseFired,
+		"event":                "tick",
+		"ts":                   t.TS.UTC().Format(time.RFC3339Nano),
+		"sec":                  t.Sec,
+		"target_qps":           t.TargetQPS,
+		"replicas":             t.Replicas,
+		"per_replica_base_qps": t.PerReplicaBaseQPS,
+		"sent":                 t.Sent,
+		"ok":                   t.OK,
+		"err":                  t.Err,
+		"drift":                t.Drift,
+		"p50_ms":               t.P50,
+		"p90_ms":               t.P90,
+		"p99_ms":               t.P99,
+		"inflight":             t.Inflight,
+		"queue":                t.Queue,
+		"sched_blocked_ms":     t.SchedBlockedMs,
+		"sched_lag_ms":         t.SchedLagMs,
+		"bursts_fired":         t.BurstsFired,
+		"spikes_fired":         t.SpikesFired,
+		"base_fired":           t.BaseFired,
 	})
 }
 

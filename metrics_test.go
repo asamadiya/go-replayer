@@ -82,8 +82,8 @@ func TestJSONLWriter_EmitsValidNDJSON(t *testing.T) {
 	var buf bytes.Buffer
 	j := NewJSONLWriter(&buf)
 	j.WriteTick(EmitTick{
-		TS: time.Unix(1700000000, 0),
-		Sec: 1, TargetQPS: 100, Sent: 99, OK: 99, Err: 0,
+		TS:  time.Unix(1700000000, 0),
+		Sec: 1, TargetQPS: 100, Replicas: 2, PerReplicaBaseQPS: 45.5, Sent: 99, OK: 99, Err: 0,
 		P50: 1.2, P90: 2.3, P99: 5.4, BurstsFired: 1, SpikesFired: 30,
 	})
 	j.WriteBurstEvent(time.Unix(1700000000, 500000000), BurstConfig{
@@ -113,6 +113,12 @@ func TestJSONLWriter_EmitsValidNDJSON(t *testing.T) {
 	}
 	if v, _ := json.Marshal(first); !strings.Contains(string(v), "p99_ms") {
 		t.Error("expected p99_ms in tick row")
+	}
+	if first["per_replica_base_qps"].(float64) != 45.5 {
+		t.Errorf("expected per_replica_base_qps in tick row, got %+v", first)
+	}
+	if _, ok := first["per_replica_qps"]; ok {
+		t.Error("did not expect ambiguous per_replica_qps in tick row")
 	}
 }
 

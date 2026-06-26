@@ -30,12 +30,13 @@ This repo is intended for replay benchmarking, replay pod takeover workflows, an
 - Sends unary gRPC requests to a target method (default:
   `/example.replay.v1.ReplayService/Score`).
 - Uses Poisson arrivals with bounded workers/queue for high-QPS stability.
+- Can split total QPS across multiple independent upstream-replica Poisson streams.
 - Supports an optional **micro-burst overlay** for intentional, parameterised burstiness.
 - Supports takeover mode (`--take-over-replay`) to auto-discover an external replay deployment's artifacts.
 
 Key behavior:
 
-- Deadline-driven Poisson scheduler (to reduce pacing drift)
+- Deadline-driven Poisson scheduler (to reduce pacing drift), with optional independent replica streams
 - Optional burst overlay (size × window × period × shape × jitter × mode) — see below
 - Bounded worker dispatch path
 - Rich per-second telemetry (`drift`, `sched_lag`, `queue`, `inflight`, latency quantiles, `bursts`/`spikes`/`base` when bursts are on)
@@ -54,6 +55,26 @@ Key behavior:
 | `--burst-mode additive\|absorbing` | `additive`: bursts ride on top of base λ. `absorbing`: base λ is reduced so long-run mean QPS = `--qps` | `additive` |
 | `--analyzer-window D` | Bin width for sender-side window analysis | `20ms` |
 | `--metrics-jsonl PATH` | Write per-second ticks, burst events, and summary as NDJSON | unset |
+
+#### Replica Poisson streams
+
+Use `--replicas R` to model traffic coming from `R` independent upstream replicas (maximum 10000). The sender keeps `--qps` as the aggregate target and splits it equally across replicas, so `--qps 300 --replicas 30` runs 30 independent Poisson streams at 10 QPS each.
+
+```bash
+./bin/go-replayer \
+  -file /tmp/replay.bin -target host:28826 \
+  -qps 300 -replicas 30 -duration 60s \
+  -tls -insecure
+```
+
+The end-of-run sender-side window analysis remains over the aggregate emitted stream. For ideal Poisson traffic, superposing independent replica streams should remain Poisson-like; the value of `--replicas` models independent sources rather than changing total mean QPS.
+
+Representative 60s simulation at 300 aggregate QPS with 20ms analysis bins:
+
+| Run | Per-replica QPS | Fano | max/bin | p99 bin count | bins ≥14 | bins ≥16 |
+|---|---:|---:|---:|---:|---:|---:|
+| `--replicas 1` | 300.0 | 0.997 | 15 | 12 | 6 | 0 |
+| `--replicas 30` | 10.0 | 1.017 | 16 | 12 | 11 | 3 |
 
 Example: 30-request spike packed into a 20ms window every 1s, with the base
 Poisson rate reduced so the long-run mean stays at `--qps`:
