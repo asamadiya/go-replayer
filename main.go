@@ -326,8 +326,9 @@ func poissonIntervalFloat(rate float64, rng *rand.Rand) time.Duration {
 	}
 	seconds := -math.Log(u) / rate
 	nanos := seconds * float64(time.Second)
-	if math.IsInf(nanos, 0) || nanos >= float64(time.Duration(1<<63-1)) {
-		return time.Duration(1<<63 - 1)
+	maxDuration := time.Duration(1<<63 - 1)
+	if math.IsInf(nanos, 0) || nanos >= float64(maxDuration) {
+		return maxDuration
 	}
 	return time.Duration(nanos)
 }
