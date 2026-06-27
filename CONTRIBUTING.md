@@ -36,7 +36,9 @@ Every pull request must pass the [CI workflow](.github/workflows/ci.yml):
 
 New behavior should ship with tests. Pure logic (parsing, scheduling, metrics,
 proto comparison) is unit-tested directly; the network target servers under
-`cmd/` are validated through the workflows documented in `SKILL.md`.
+`cmd/` are validated through the workflows documented in `SKILL.md`. CI enforces
+a total statement-coverage floor of 40% (`go tool cover -func`), so substantial
+new code must come with tests.
 
 ## Conventions
 

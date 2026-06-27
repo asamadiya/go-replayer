@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -43,43 +45,49 @@ type request struct {
 	payload []byte
 }
 
+// loadRequests streams length-prefixed records from path without reading the
+// whole (potentially multi-GB) file into memory, validating length prefixes
+// before allocating and erroring on any truncation.
 func loadRequests(path string) ([]request, error) {
-	data, err := os.ReadFile(path)
+	const (
+		maxMethodLen  = 1024
+		maxPayloadLen = 256 * 1024 * 1024
+	)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	const maxPayloadLen = 256 * 1024 * 1024
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 1<<20)
+
 	var reqs []request
-	offset := 0
-	for offset < len(data) {
-		if offset+4 > len(data) {
-			return nil, fmt.Errorf("truncated method-length prefix at offset %d (record %d)", offset, len(reqs))
+	for {
+		var methodLen uint32
+		if err := binary.Read(r, binary.BigEndian, &methodLen); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("reading method length at record %d: %w", len(reqs), err)
 		}
-		methodLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
-		offset += 4
-		if methodLen == 0 || methodLen > 1024 {
+		if methodLen == 0 || methodLen > maxMethodLen {
 			return nil, fmt.Errorf("invalid method length %d at record %d", methodLen, len(reqs))
 		}
-		if offset+methodLen > len(data) {
-			return nil, fmt.Errorf("truncated method bytes at record %d", len(reqs))
+		method := make([]byte, methodLen)
+		if _, err := io.ReadFull(r, method); err != nil {
+			return nil, fmt.Errorf("truncated method bytes at record %d: %w", len(reqs), err)
 		}
-		method := string(data[offset : offset+methodLen])
-		offset += methodLen
-		if offset+4 > len(data) {
-			return nil, fmt.Errorf("truncated payload-length prefix at record %d", len(reqs))
+		var payloadLen uint32
+		if err := binary.Read(r, binary.BigEndian, &payloadLen); err != nil {
+			return nil, fmt.Errorf("reading payload length at record %d: %w", len(reqs), err)
 		}
-		payloadLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
-		offset += 4
 		if payloadLen > maxPayloadLen {
 			return nil, fmt.Errorf("invalid payload length %d at record %d (max %d)", payloadLen, len(reqs), maxPayloadLen)
 		}
-		if offset+payloadLen > len(data) {
-			return nil, fmt.Errorf("truncated payload at record %d", len(reqs))
-		}
 		payload := make([]byte, payloadLen)
-		copy(payload, data[offset:offset+payloadLen])
-		offset += payloadLen
-		reqs = append(reqs, request{method: method, payload: payload})
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, fmt.Errorf("truncated payload at record %d: %w", len(reqs), err)
+		}
+		reqs = append(reqs, request{method: string(method), payload: payload})
 	}
 	if len(reqs) == 0 {
 		return nil, fmt.Errorf("no requests found in %s", path)
@@ -130,6 +138,7 @@ func main() {
 		key          = flag.String("key", "", "Client key path")
 		timeout      = flag.Duration("timeout", 30*time.Second, "Per-request timeout")
 		outputFile   = flag.String("output", "", "Write detailed results to CSV")
+		allowErrors  = flag.Bool("allow-errors", false, "Exit 0 even when some requests returned RPC errors")
 	)
 	flag.Parse()
 
@@ -190,6 +199,7 @@ func main() {
 		totalByteDiff int64
 		mu            sync.Mutex
 		diffs         []float64
+		csvErr        error // first CSV write/close error (guarded by mu)
 	)
 
 	var csvFile *os.File
@@ -199,8 +209,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ERROR creating output file %s: %v\n", *outputFile, err)
 			os.Exit(1)
 		}
-		defer csvFile.Close()
-		fmt.Fprintln(csvFile, "index,match,max_abs_diff,total_floats,mismatch_floats,size_a,size_b,latency_a_ms,latency_b_ms,err_a,err_b")
+		if _, werr := fmt.Fprintln(csvFile, "index,match,max_abs_diff,total_floats,mismatch_floats,size_a,size_b,latency_a_ms,latency_b_ms,err_a,err_b"); werr != nil {
+			csvErr = werr
+		}
 	}
 
 	sem := make(chan struct{}, 32) // concurrency limit
@@ -273,11 +284,13 @@ func main() {
 				mu.Lock()
 				diffs = append(diffs, maxDiff)
 				if csvFile != nil {
-					fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,,\n",
+					if _, werr := fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,,\n",
 						idx, match, maxDiff, totalFloats, mismatchCount,
 						len(respA), len(respB),
 						float64(latA.Microseconds())/1000.0,
-						float64(latB.Microseconds())/1000.0)
+						float64(latB.Microseconds())/1000.0); werr != nil && csvErr == nil {
+						csvErr = werr
+					}
 				}
 				mu.Unlock()
 			}
@@ -337,11 +350,25 @@ func main() {
 
 	fmt.Println(strings.Repeat("═", 70))
 
-	if totalMismatch > 0 {
+	if csvFile != nil {
+		if cerr := csvFile.Close(); cerr != nil && csvErr == nil {
+			csvErr = cerr
+		}
+	}
+	if csvErr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: CSV output error: %v\n", csvErr)
+	}
+
+	totalErrors := totalErrA + totalErrB + totalBothErr
+	switch {
+	case totalMismatch > 0:
 		fmt.Printf("\n❌ PARITY FAILED: %d mismatches at tolerance %.0e\n", totalMismatch, *tolerance)
 		os.Exit(1)
-	} else {
-		fmt.Printf("\n✅ PARITY PASSED: 100%% match at tolerance %.0e\n", *tolerance)
+	case totalErrors > 0 && !*allowErrors:
+		fmt.Printf("\n❌ PARITY FAILED: %d requests returned RPC errors (pass --allow-errors to ignore)\n", totalErrors)
+		os.Exit(1)
+	default:
+		fmt.Printf("\n✅ PARITY PASSED at tolerance %.0e\n", *tolerance)
 		os.Exit(0)
 	}
 }

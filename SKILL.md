@@ -155,7 +155,7 @@ Per-second stdout adds `bursts=N spikes=N base=N` columns. End-of-run window ana
 | `additive` | `qps + size/period` | `qps` | A/B "what if I just add bursts" — total load increases. |
 | `absorbing` | `qps` | `qps - size/period` (floored at 0) | A/B "shape vs no-shape at fixed mean QPS" — isolates burstiness from rate. |
 
-`absorbing` is the right default for SLO regression: the SUT sees the same average load with and without bursts.
+`absorbing` is the right default for SLO regression: the SUT sees the same average load with and without bursts. A config whose burst average (`--burst-size / --burst-period`) exceeds `--qps` cannot be absorbed and is rejected at startup.
 
 ## Workflow 3 — Verify burst shape with grpc-gap-target (loopback)
 
@@ -201,7 +201,10 @@ Use `grpc-parity-check` (not the replayer) for response-byte / float comparison:
   -qps 100 -duration 60s
 ```
 
-Reports per-request mismatches and float-diff distribution.
+Reports per-request mismatches and float-diff distribution. Exits non-zero on
+any mismatch, and on any RPC error unless `-allow-errors` is set. Byte-different
+responses with no comparable floats are counted as mismatches, never silent
+passes.
 
 ## Workflow 5 — Replay-deployment takeover
 

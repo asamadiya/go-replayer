@@ -32,15 +32,28 @@ func (rawCodec) Name() string { return "proto" }
 
 func init() { encoding.RegisterCodec(rawCodec{}) }
 
+// arrivalSampleCap and maxBins bound memory so a long-running or high-QPS
+// target cannot grow the arrival buffer or the per-window histogram without
+// limit.
+const (
+	arrivalSampleCap = 5_000_000
+	maxBins          = 5_000_000
+)
+
 type stats struct {
 	mu          sync.Mutex
 	arrivalsNs  []int64
+	dropped     int64
 	peerLogOnce sync.Once
 }
 
 func (s *stats) recordArrival(ts time.Time) {
 	s.mu.Lock()
-	s.arrivalsNs = append(s.arrivalsNs, ts.UnixNano())
+	if len(s.arrivalsNs) < arrivalSampleCap {
+		s.arrivalsNs = append(s.arrivalsNs, ts.UnixNano())
+	} else {
+		s.dropped++
+	}
 	s.mu.Unlock()
 }
 
@@ -114,6 +127,11 @@ func analyzeWindows(arrivals []int64, window time.Duration, threshold int) (numW
 	last := arrivals[len(arrivals)-1]
 	windowNs := int64(window)
 	numWindows = (last-first)/windowNs + 1
+	if numWindows > maxBins {
+		// Pathological span/window ratio — clamp the histogram size. Arrivals
+		// past the last bin fold into it (handled by the idx clamp below).
+		numWindows = maxBins
+	}
 	counts := make([]int, numWindows)
 	for _, ts := range arrivals {
 		idx := (ts - first) / windowNs
@@ -287,5 +305,11 @@ func main() {
 		fmt.Printf("server exited: %v\n", err)
 	}
 
+	st.mu.Lock()
+	dropped := st.dropped
+	st.mu.Unlock()
+	if dropped > 0 {
+		fmt.Printf("note: %d arrivals dropped after the %d-sample cap; summary covers the captured prefix\n", dropped, arrivalSampleCap)
+	}
 	printSummary(st.snapshot())
 }

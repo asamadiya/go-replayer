@@ -19,16 +19,21 @@ This repo is intended for replay benchmarking, replay pod takeover workflows, an
 ├── main_test.go                     # parser/takeover unit tests
 ├── scheduler_test.go                # scheduler + burst + replica tests
 ├── metrics_test.go                  # metrics / window-analysis tests
+├── hardening_test.go                # reservoir, absorbing precision, parser-bounds, writer-error tests
 ├── cmd/
 │   ├── grpc-dummy-target/
-│   │   └── main.go                  # lightweight TLS target for replay smoke tests
+│   │   ├── main.go                  # lightweight TLS target for replay smoke tests
+│   │   └── main_test.go
 │   ├── grpc-gap-target/
-│   │   └── main.go                  # target that measures inter-arrival/burst Poisson fit
+│   │   ├── main.go                  # target that measures inter-arrival/burst Poisson fit
+│   │   └── main_test.go             # quantile / Poisson-tail / window-analysis tests
 │   └── grpc-parity-check/
 │       ├── main.go                  # compares responses from two gRPC targets
 │       ├── proto_compare.go         # protobuf float extraction/comparison helpers
-│       └── proto_compare_test.go    # unit tests for the comparison logic
-├── .github/workflows/ci.yml         # build / vet / fmt / race-test / lint
+│       ├── proto_compare_test.go    # comparison-logic tests
+│       └── hardening_test.go        # strict-parser + false-pass-guard tests
+├── .github/workflows/ci.yml         # build / vet / fmt / race-test / lint / coverage floor
+├── .golangci.yml                    # linter configuration
 ├── Makefile                         # build, test, lint, cover targets
 ├── CONTRIBUTING.md                  # development guide and quality gates
 ├── CHANGELOG.md
@@ -70,6 +75,11 @@ Key behavior:
 | `--burst-mode additive\|absorbing` | `additive`: bursts ride on top of base λ. `absorbing`: base λ is reduced so long-run mean QPS = `--qps` | `additive` |
 | `--analyzer-window D` | Bin width for sender-side window analysis | `20ms` |
 | `--metrics-jsonl PATH` | Write per-second ticks, burst events, and summary as NDJSON | unset |
+
+In `absorbing` mode the base Poisson rate is reduced by the burst average so the
+long-run mean stays at `--qps`. A configuration whose burst average
+(`--burst-size / --burst-period`) exceeds `--qps` cannot be absorbed and is
+rejected at startup.
 
 #### Replica Poisson streams
 
@@ -119,6 +129,9 @@ Poisson rate reduced so the long-run mean stays at `--qps`:
 
 - Sends the same replayed requests to two targets (`--target-a`, `--target-b`).
 - Compares returned bytes and float values within configurable tolerance.
+- Byte-different responses with no comparable floats (or a differing number of
+  floats) are treated as mismatches, not silent passes.
+- Exits non-zero on any mismatch, and on any RPC error unless `--allow-errors`.
 - Useful for validating batching/no-batching response parity during rollout.
 
 ## Build guide

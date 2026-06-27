@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `grpc-parity-check` no longer falsely certifies byte-different responses that
   contain no comparable floats or a differing number of floats.
+- `grpc-parity-check` now exits non-zero when requests return RPC errors (opt
+  out with `--allow-errors`), instead of reporting success.
+- `grpc-parity-check` streams its replay file instead of reading the whole
+  (possibly multi-GB) file into memory.
+- CSV and JSONL write/close errors are now checked and surfaced, including the
+  final summary row.
+- `grpc-gap-target` bounds its arrival buffer and per-window histogram so a
+  long-lived target cannot grow without limit.
 - Absorbing burst mode now preserves `--qps` exactly using a float64 base rate,
   and rejects configurations whose burst average exceeds the target QPS.
 - Replay-file parsers reject malformed length prefixes instead of attempting

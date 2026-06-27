@@ -715,14 +715,16 @@ func main() {
 	)
 
 	var csvFile *os.File
+	var csvErr error // first CSV write/close error (guarded by mu while workers run)
 	if *outputPath != "" {
 		csvFile, err = os.Create(*outputPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR creating output file %s: %v\n", *outputPath, err)
 			os.Exit(1)
 		}
-		defer csvFile.Close()
-		fmt.Fprintln(csvFile, "timestamp_ns,latency_ms,status")
+		if _, werr := fmt.Fprintln(csvFile, "timestamp_ns,latency_ms,status"); werr != nil {
+			csvErr = werr
+		}
 	}
 
 	jsonl, closeJSONL, err := OpenJSONLWriter(*metricsJSONL)
@@ -899,7 +901,9 @@ func main() {
 					if err != nil {
 						status = "err"
 					}
-					fmt.Fprintf(csvFile, "%d,%.3f,%s\n", start.UnixNano(), lat, status)
+					if _, werr := fmt.Fprintf(csvFile, "%d,%.3f,%s\n", start.UnixNano(), lat, status); werr != nil && csvErr == nil {
+						csvErr = werr
+					}
 				}
 				mu.Unlock()
 			}
@@ -938,6 +942,12 @@ func main() {
 	close(reporterStop)
 	reporterWG.Wait()
 	time.Sleep(100 * time.Millisecond)
+
+	if csvFile != nil {
+		if cerr := csvFile.Close(); cerr != nil && csvErr == nil {
+			csvErr = cerr
+		}
+	}
 
 	mu.Lock()
 	latMin, latAvg, latP50, latP90, latP99, latMax, latN := okLat.summary()
@@ -1019,13 +1029,18 @@ func main() {
 			"max": latMax,
 		}
 	}
-	if jerr := jsonl.Err(); jerr != nil {
-		fmt.Fprintf(os.Stderr, "WARN: jsonl metrics writer error: %v\n", jerr)
-	}
 	if dropped := analyzer.Dropped(); dropped > 0 {
 		fmt.Fprintf(os.Stderr, "WARN: window analyzer dropped %d samples (cap reached); shape stats cover the first %d dispatches\n", dropped, analyzerSampleCap)
 	}
 	jsonl.WriteSummary(summaryRow)
+	// Check the JSONL writer error AFTER the final summary write so a failure on
+	// that last row is still surfaced.
+	if jerr := jsonl.Err(); jerr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: jsonl metrics writer error: %v\n", jerr)
+	}
+	if csvErr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: CSV output error: %v\n", csvErr)
+	}
 	fmt.Println("────────────────────────────────────────────────────────────")
 }
 
