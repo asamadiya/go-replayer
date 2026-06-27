@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sample (exact min/max/count) instead of an unbounded slice.
 - `grpc-gap-target` sorts its arrival snapshot before gap/window analysis, so
   out-of-order timestamps from concurrent handlers cannot corrupt statistics.
+- The sender caps the distinct error-message map (high-cardinality target
+  errors fold into an "other" counter) so it cannot grow with request count.
+- `grpc-parity-check` reports byte-identical responses from a dedicated counter
+  instead of a formula that could go negative or miscount with errors present.
 - Absorbing burst mode now preserves `--qps` exactly using a float64 base rate,
   and rejects configurations whose burst average exceeds the target QPS.
 - Replay-file parsers reject malformed length prefixes instead of attempting

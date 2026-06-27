@@ -49,6 +49,11 @@ const (
 	// string/slice headers + allocator overhead) so that a file of many tiny
 	// records is also bounded by maxTotalReplayBytes, not just payload bytes.
 	perRecordOverhead = 64
+
+	// maxDistinctErrors bounds the distinct error-message map so a target that
+	// returns high-cardinality error strings cannot grow memory with the
+	// request count; further distinct messages fold into an "other" counter.
+	maxDistinctErrors = 1024
 )
 
 var (
@@ -719,6 +724,7 @@ func main() {
 		secLatencies          []float64
 		okLat                 = newLatencyStats(latRng)
 		errorCounts           = make(map[string]int)
+		otherErrors           int64
 		inflight              int64
 		schedulerBlockedNanos int64
 		schedulerLagNanos     int64
@@ -903,7 +909,11 @@ func main() {
 				mu.Lock()
 				secLatencies = append(secLatencies, lat)
 				if errSummary != "" {
-					errorCounts[errSummary]++
+					if _, seen := errorCounts[errSummary]; seen || len(errorCounts) < maxDistinctErrors {
+						errorCounts[errSummary]++
+					} else {
+						otherErrors++
+					}
 				} else {
 					okLat.add(lat)
 				}
@@ -966,6 +976,7 @@ func main() {
 	for msg, cnt := range errorCounts {
 		errSnapshot[msg] = cnt
 	}
+	otherErrCount := otherErrors
 	mu.Unlock()
 
 	elapsed := time.Since(startTime)
@@ -1004,6 +1015,9 @@ func main() {
 		fmt.Println("Top errors:")
 		for _, item := range top {
 			fmt.Printf("  [%d] %s\n", item.cnt, item.msg)
+		}
+		if otherErrCount > 0 {
+			fmt.Printf("  [%d] (other error messages beyond the first %d distinct)\n", otherErrCount, maxDistinctErrors)
 		}
 	}
 

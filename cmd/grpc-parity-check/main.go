@@ -235,16 +235,17 @@ func main() {
 
 	interval := time.Second / time.Duration(*qps)
 	var (
-		totalSent     int64
-		totalMatch    int64
-		totalMismatch int64
-		totalErrA     int64
-		totalErrB     int64
-		totalBothErr  int64
-		totalByteDiff int64
-		mu            sync.Mutex
-		diffs         = newDiffSampler(rand.New(rand.NewSource(time.Now().UnixNano())))
-		csvErr        error // first CSV write/close error (guarded by mu)
+		totalSent          int64
+		totalMatch         int64
+		totalMismatch      int64
+		totalErrA          int64
+		totalErrB          int64
+		totalBothErr       int64
+		totalByteDiff      int64
+		totalByteIdentical int64
+		mu                 sync.Mutex
+		diffs              = newDiffSampler(rand.New(rand.NewSource(time.Now().UnixNano())))
+		csvErr             error // first CSV write/close error (guarded by mu)
 	)
 
 	var csvFile *os.File
@@ -317,6 +318,7 @@ func main() {
 				atomic.AddInt64(&totalErrB, 1)
 			case bytes.Equal(respA, respB):
 				atomic.AddInt64(&totalMatch, 1)
+				atomic.AddInt64(&totalByteIdentical, 1)
 			default:
 				atomic.AddInt64(&totalByteDiff, 1)
 				match, maxDiff, totalFloats, mismatchCount := compareProtoFloats(respA, respB, *tolerance)
@@ -370,7 +372,7 @@ func main() {
 	fmt.Printf("  Duration:           %s\n", elapsed.Round(time.Second))
 	fmt.Printf("  Tolerance:          %.0e\n", *tolerance)
 	fmt.Println()
-	fmt.Printf("  Byte-identical:     %d\n", totalMatch-totalByteDiff+atomic.LoadInt64(&totalBothErr))
+	fmt.Printf("  Byte-identical:     %d\n", totalByteIdentical)
 	fmt.Printf("  Float-match:        %d  (within tolerance)\n", totalByteDiff-totalMismatch)
 	fmt.Printf("  MISMATCH:           %d\n", totalMismatch)
 	fmt.Printf("  Errors (A only):    %d\n", totalErrA)
