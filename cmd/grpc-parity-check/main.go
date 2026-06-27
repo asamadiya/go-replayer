@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"sort"
 	"strings"
@@ -45,6 +46,41 @@ type request struct {
 	payload []byte
 }
 
+const maxDiffSamples = 1 << 20
+
+// diffSampler keeps an exact count/min/max plus a bounded reservoir (Algorithm
+// R) of float differences so a long / high-QPS parity run reports a
+// distribution without unbounded memory growth. Not safe for concurrent use;
+// callers serialise via their own mutex.
+type diffSampler struct {
+	count     int64
+	min       float64
+	max       float64
+	reservoir []float64
+	rng       *rand.Rand
+}
+
+func newDiffSampler(rng *rand.Rand) *diffSampler {
+	return &diffSampler{reservoir: make([]float64, 0, 1024), rng: rng}
+}
+
+func (d *diffSampler) add(v float64) {
+	if d.count == 0 || v < d.min {
+		d.min = v
+	}
+	if d.count == 0 || v > d.max {
+		d.max = v
+	}
+	d.count++
+	if len(d.reservoir) < maxDiffSamples {
+		d.reservoir = append(d.reservoir, v)
+		return
+	}
+	if j := d.rng.Int63n(d.count); j < int64(len(d.reservoir)) {
+		d.reservoir[j] = v
+	}
+}
+
 // loadRequests reads length-prefixed records from path incrementally (it never
 // buffers the whole raw file), validating each length prefix before allocating
 // and erroring on truncation. The parsed requests are retained in memory so
@@ -55,6 +91,7 @@ func loadRequests(path string) ([]request, error) {
 		maxMethodLen        = 1024
 		maxPayloadLen       = 256 * 1024 * 1024
 		maxTotalReplayBytes = int64(8) << 30 // 8 GiB
+		perRecordOverhead   = 64             // approx retained heap per request
 	)
 	f, err := os.Open(path)
 	if err != nil {
@@ -87,7 +124,7 @@ func loadRequests(path string) ([]request, error) {
 		if payloadLen > maxPayloadLen {
 			return nil, fmt.Errorf("invalid payload length %d at record %d (max %d)", payloadLen, len(reqs), maxPayloadLen)
 		}
-		totalBytes += int64(methodLen) + int64(payloadLen)
+		totalBytes += int64(methodLen) + int64(payloadLen) + perRecordOverhead
 		if totalBytes > maxTotalReplayBytes {
 			return nil, fmt.Errorf("replay file exceeds the %d-byte in-memory cap at record %d; use --n or a smaller file", maxTotalReplayBytes, len(reqs))
 		}
@@ -206,7 +243,7 @@ func main() {
 		totalBothErr  int64
 		totalByteDiff int64
 		mu            sync.Mutex
-		diffs         []float64
+		diffs         = newDiffSampler(rand.New(rand.NewSource(time.Now().UnixNano())))
 		csvErr        error // first CSV write/close error (guarded by mu)
 	)
 
@@ -290,7 +327,7 @@ func main() {
 				}
 
 				mu.Lock()
-				diffs = append(diffs, maxDiff)
+				diffs.add(maxDiff)
 				if csvFile != nil {
 					if _, werr := fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,,\n",
 						idx, match, maxDiff, totalFloats, mismatchCount,
@@ -344,16 +381,26 @@ func main() {
 	parity := float64(totalMatch) / float64(totalSent) * 100
 	fmt.Printf("  PARITY RATE:        %.2f%%  (%d/%d)\n", parity, totalMatch, totalSent)
 
-	if len(diffs) > 0 {
-		sort.Float64s(diffs)
-		n := len(diffs)
+	if diffs.count > 0 {
+		s := append([]float64(nil), diffs.reservoir...)
+		sort.Float64s(s)
+		q := func(p float64) float64 {
+			if len(s) == 0 {
+				return 0
+			}
+			idx := int(p * float64(len(s)))
+			if idx >= len(s) {
+				idx = len(s) - 1
+			}
+			return s[idx]
+		}
 		fmt.Println()
 		fmt.Println("  Float difference distribution (responses with byte differences):")
-		fmt.Printf("    min:    %.8f\n", diffs[0])
-		fmt.Printf("    p50:    %.8f\n", diffs[n/2])
-		fmt.Printf("    p90:    %.8f\n", diffs[int(float64(n)*0.9)])
-		fmt.Printf("    p99:    %.8f\n", diffs[int(float64(n)*0.99)])
-		fmt.Printf("    max:    %.8f\n", diffs[n-1])
+		fmt.Printf("    min:    %.8f\n", diffs.min)
+		fmt.Printf("    p50:    %.8f\n", q(0.50))
+		fmt.Printf("    p90:    %.8f\n", q(0.90))
+		fmt.Printf("    p99:    %.8f\n", q(0.99))
+		fmt.Printf("    max:    %.8f\n", diffs.max)
 	}
 
 	fmt.Println(strings.Repeat("═", 70))

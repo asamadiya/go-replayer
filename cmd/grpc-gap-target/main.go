@@ -155,6 +155,11 @@ func analyzeWindows(arrivals []int64, window time.Duration, threshold int) (numW
 }
 
 func printSummary(arrivals []int64) {
+	// Concurrent handlers may capture time.Now() before acquiring the stats
+	// lock, so the recorded order is not guaranteed monotonic. Sort the
+	// snapshot before any gap/window analysis that assumes ascending order.
+	sort.Slice(arrivals, func(i, j int) bool { return arrivals[i] < arrivals[j] })
+
 	n := len(arrivals)
 	if n < 2 {
 		fmt.Printf("summary: requests=%d (need >=2 for gap analysis)\n", n)

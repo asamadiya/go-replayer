@@ -2,10 +2,38 @@ package main
 
 import (
 	"encoding/binary"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestDiffSamplerExactMinMax(t *testing.T) {
+	d := newDiffSampler(rand.New(rand.NewSource(1)))
+	for _, v := range []float64{0.3, 0.1, 0.9, 0.5} {
+		d.add(v)
+	}
+	if d.count != 4 || d.min != 0.1 || d.max != 0.9 {
+		t.Fatalf("count/min/max = %d/%v/%v", d.count, d.min, d.max)
+	}
+}
+
+func TestDiffSamplerReservoirBounded(t *testing.T) {
+	d := newDiffSampler(rand.New(rand.NewSource(1)))
+	const extra = 500
+	for i := 0; i < maxDiffSamples+extra; i++ {
+		d.add(float64(i))
+	}
+	if len(d.reservoir) != maxDiffSamples {
+		t.Fatalf("reservoir grew past cap: %d", len(d.reservoir))
+	}
+	if d.count != int64(maxDiffSamples+extra) {
+		t.Fatalf("count not exact: %d", d.count)
+	}
+	if d.min != 0 || d.max != float64(maxDiffSamples+extra-1) {
+		t.Fatalf("min/max wrong: %v/%v", d.min, d.max)
+	}
+}
 
 func writeParityRec(b *[]byte, method string, payload []byte) {
 	var mlen [4]byte

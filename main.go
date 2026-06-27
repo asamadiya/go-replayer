@@ -44,6 +44,11 @@ const (
 	// maxTotalReplayBytes caps the total retained request data so a pathological
 	// or hostile replay file cannot exhaust memory.
 	maxTotalReplayBytes = int64(8) << 30 // 8 GiB
+
+	// perRecordOverhead approximates the retained heap per request (struct +
+	// string/slice headers + allocator overhead) so that a file of many tiny
+	// records is also bounded by maxTotalReplayBytes, not just payload bytes.
+	perRecordOverhead = 64
 )
 
 var (
@@ -216,8 +221,7 @@ func loadRequests(path string) ([]request, error) {
 		if _, err := io.ReadFull(f, payload); err != nil {
 			return nil, fmt.Errorf("reading request body (%d bytes): %w", payloadLen, err)
 		}
-		recordBytes := int64(8 + methodLen + payloadLen)
-		totalBytes += recordBytes
+		totalBytes += int64(methodLen) + int64(payloadLen) + perRecordOverhead
 		if totalBytes > maxTotalReplayBytes {
 			return nil, fmt.Errorf("replay file exceeds the %d-byte in-memory cap at record %d", maxTotalReplayBytes, len(reqs))
 		}
