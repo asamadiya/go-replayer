@@ -82,6 +82,18 @@ func TestCompareProtoFloatsNoComparableFloatsIsMismatch(t *testing.T) {
 	}
 }
 
+func TestExtractFloatsMalformedLengthNoPanic(t *testing.T) {
+	// A length-delimited field whose varint length is ~2^64 but with only a few
+	// trailing bytes. The bounds check must reject it before the int conversion
+	// rather than panicking on an out-of-range / negative slice index.
+	tag := encVarint(uint64(5)<<3 | 2)
+	hugeLen := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
+	msg := append(append(tag, hugeLen...), 0x01, 0x02)
+	// Must not panic.
+	_ = extractTopLevelFloats(msg)
+	_ = extractShallowFloats(msg)
+}
+
 func TestCompareProtoFloatsUnequalCountsMismatch(t *testing.T) {
 	a := append(fieldFloat64(1, 1.0), fieldFloat64(2, 2.0)...)
 	b := fieldFloat64(1, 1.0)

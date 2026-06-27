@@ -40,6 +40,10 @@ const (
 	// maxLatencySamples bounds the reservoir used for latency percentiles so
 	// arbitrarily long / high-QPS runs stay memory-bounded.
 	maxLatencySamples = 1 << 20 // 1,048,576
+
+	// maxTotalReplayBytes caps the total retained request data so a pathological
+	// or hostile replay file cannot exhaust memory.
+	maxTotalReplayBytes = int64(8) << 30 // 8 GiB
 )
 
 var (
@@ -214,6 +218,9 @@ func loadRequests(path string) ([]request, error) {
 		}
 		recordBytes := int64(8 + methodLen + payloadLen)
 		totalBytes += recordBytes
+		if totalBytes > maxTotalReplayBytes {
+			return nil, fmt.Errorf("replay file exceeds the %d-byte in-memory cap at record %d", maxTotalReplayBytes, len(reqs))
+		}
 
 		methodName := string(method)
 		if err := validateLoadedRequest(methodName, payload); err != nil {

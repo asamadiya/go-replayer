@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   final summary row.
 - `grpc-gap-target` bounds its arrival buffer and per-window histogram so a
   long-lived target cannot grow without limit.
+- Protobuf length-delimited parsing in `grpc-parity-check` validates field
+  lengths against remaining bytes before converting to `int`, preventing an
+  overflow/panic on crafted input.
+- Replay-file parsers cap total retained request bytes (8 GiB) so a pathological
+  or hostile file cannot exhaust memory.
 - Absorbing burst mode now preserves `--qps` exactly using a float64 base rate,
   and rejects configurations whose burst average exceeds the target QPS.
 - Replay-file parsers reject malformed length prefixes instead of attempting

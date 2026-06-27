@@ -45,13 +45,16 @@ type request struct {
 	payload []byte
 }
 
-// loadRequests streams length-prefixed records from path without reading the
-// whole (potentially multi-GB) file into memory, validating length prefixes
-// before allocating and erroring on any truncation.
+// loadRequests reads length-prefixed records from path incrementally (it never
+// buffers the whole raw file), validating each length prefix before allocating
+// and erroring on truncation. The parsed requests are retained in memory so
+// duration looping can replay them; total retained bytes are capped at
+// maxTotalReplayBytes to stay bounded on pathological inputs.
 func loadRequests(path string) ([]request, error) {
 	const (
-		maxMethodLen  = 1024
-		maxPayloadLen = 256 * 1024 * 1024
+		maxMethodLen        = 1024
+		maxPayloadLen       = 256 * 1024 * 1024
+		maxTotalReplayBytes = int64(8) << 30 // 8 GiB
 	)
 	f, err := os.Open(path)
 	if err != nil {
@@ -61,6 +64,7 @@ func loadRequests(path string) ([]request, error) {
 	r := bufio.NewReaderSize(f, 1<<20)
 
 	var reqs []request
+	var totalBytes int64
 	for {
 		var methodLen uint32
 		if err := binary.Read(r, binary.BigEndian, &methodLen); err != nil {
@@ -82,6 +86,10 @@ func loadRequests(path string) ([]request, error) {
 		}
 		if payloadLen > maxPayloadLen {
 			return nil, fmt.Errorf("invalid payload length %d at record %d (max %d)", payloadLen, len(reqs), maxPayloadLen)
+		}
+		totalBytes += int64(methodLen) + int64(payloadLen)
+		if totalBytes > maxTotalReplayBytes {
+			return nil, fmt.Errorf("replay file exceeds the %d-byte in-memory cap at record %d; use --n or a smaller file", maxTotalReplayBytes, len(reqs))
 		}
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(r, payload); err != nil {

@@ -42,13 +42,16 @@ func extractTopLevelFloats(data []byte) []float64 {
 				return floats
 			}
 			offset += n
-			if offset+int(length) > len(data) {
+			// Validate against remaining bytes BEFORE converting to int, so a
+			// crafted oversized varint cannot overflow int and bypass the guard.
+			if length > uint64(len(data)-offset) {
 				return floats
 			}
+			end := offset + int(length)
 			// Walk this submessage for float fields (one level only)
-			subFloats := extractShallowFloats(data[offset : offset+int(length)])
+			subFloats := extractShallowFloats(data[offset:end])
 			floats = append(floats, subFloats...)
-			offset += int(length)
+			offset = end
 		case 5: // 32-bit (float)
 			if offset+4 > len(data) {
 				return floats
@@ -102,6 +105,9 @@ func extractShallowFloats(data []byte) []float64 {
 				return floats
 			}
 			offset += n
+			if length > uint64(len(data)-offset) {
+				return floats
+			}
 			offset += int(length)
 		case 5: // float
 			if offset+4 > len(data) {

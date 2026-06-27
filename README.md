@@ -117,7 +117,7 @@ Poisson rate reduced so the long-run mean stays at `--qps`:
 
 - Minimal TLS gRPC target for functional replay validation.
 - Accepts unknown service/method and responds quickly.
-- Optional client-cert requirement for identity verification.
+- Optional client-cert *presentation* requirement (presence-only diagnostic logging; the cert is not trust-verified, so this is not client authentication).
 
 ### 3) Gap target (`cmd/grpc-gap-target`)
 
