@@ -1,5 +1,9 @@
 # go-replayer
 
+[![CI](https://github.com/asamadiya/go-replayer/actions/workflows/ci.yml/badge.svg)](https://github.com/asamadiya/go-replayer/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/asamadiya/go-replayer.svg)](https://pkg.go.dev/github.com/asamadiya/go-replayer)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A high-throughput gRPC replay tool with Poisson pacing, plus local target servers for validation and burstiness diagnostics.
 
 This repo is intended for replay benchmarking, replay pod takeover workflows, and reproducible replay-quality testing (especially tail-latency-sensitive workloads).
@@ -8,16 +12,27 @@ This repo is intended for replay benchmarking, replay pod takeover workflows, an
 
 ```text
 .
-├── main.go                          # go-replayer binary
+├── main.go                          # go-replayer sender binary (entrypoint + flags)
+├── doc.go                           # package documentation
+├── scheduler.go                     # deadline-driven Poisson scheduler + replica streams + burst overlay
+├── metrics.go                       # NDJSON metrics + sender-side window analysis
 ├── main_test.go                     # parser/takeover unit tests
+├── scheduler_test.go                # scheduler + burst + replica tests
+├── metrics_test.go                  # metrics / window-analysis tests
 ├── cmd/
 │   ├── grpc-dummy-target/
 │   │   └── main.go                  # lightweight TLS target for replay smoke tests
-│   └── grpc-gap-target/
-│       └── main.go                  # target that measures inter-arrival/burst Poisson fit
+│   ├── grpc-gap-target/
+│   │   └── main.go                  # target that measures inter-arrival/burst Poisson fit
 │   └── grpc-parity-check/
 │       ├── main.go                  # compares responses from two gRPC targets
-│       └── proto_compare.go         # protobuf float extraction/comparison helpers
+│       ├── proto_compare.go         # protobuf float extraction/comparison helpers
+│       └── proto_compare_test.go    # unit tests for the comparison logic
+├── .github/workflows/ci.yml         # build / vet / fmt / race-test / lint
+├── Makefile                         # build, test, lint, cover targets
+├── CONTRIBUTING.md                  # development guide and quality gates
+├── CHANGELOG.md
+├── SKILL.md                         # operational guide (loadable skill)
 ├── go.mod
 └── go.sum
 ```
@@ -128,8 +143,13 @@ Binaries are built locally into `bin/` (git-ignored); the repo ships source only
 ### Run unit tests
 
 ```bash
-go test ./...
+go test ./...          # unit tests
+go test -race ./...    # with the race detector
+make cover             # coverage summary
 ```
+
+A `Makefile` wraps the common loops: `make all` (fmt-check, vet, test, build),
+`make lint`, `make race`, and `make cover`.
 
 ## Development guide
 
@@ -181,3 +201,13 @@ go build ./...
 |---|---|---|---|---|
 | Poisson only, 200 QPS, 10s | 1.156 | 14 | 9 | 0 |
 | `--burst-size 30 --burst-shape spike --burst-period 1s --burst-mode absorbing`, same target QPS | 4.598 | 37 | 32 | 9 |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development loop, quality gates,
+and conventions. In short: branch from `master`, add tests and doc updates, and
+ensure `make all && make lint` is green before opening a PR.
+
+## License
+
+Released under the [MIT License](LICENSE).

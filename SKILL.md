@@ -48,7 +48,8 @@ Binaries are built locally into `bin/` (git-ignored); the repo ships source only
 |---|---|---|
 | `-file PATH` | yes (unless `-take-over-replay`) | Replay file (length-prefixed format above) |
 | `-target HOST:PORT` | yes | gRPC target. Also accepts `(host,port)` and `["host","port"]` |
-| `-qps N` | no (default 10) | Target average QPS (Poisson rate) |
+| `-qps N` | no (default 10) | Target average QPS (Poisson rate, aggregate across replicas) |
+| `-replicas N` | no (default 1) | Split `-qps` across `N` independent Poisson streams (max 10000) |
 | `-duration D` | no (default 1m) | Run length |
 | `-method PATH` | no | Override method (default `/example.replay.v1.ReplayService/Score`) |
 | `-tls` / `-insecure` | no | TLS on by default; `-insecure` skips cert verify |
@@ -71,6 +72,17 @@ Binaries are built locally into `bin/` (git-ignored); the repo ships source only
 | `-burst-mode M` | `additive` | `additive`: bursts ride on top of base λ. `absorbing`: base λ reduced so long-run mean QPS == `-qps` |
 | `-metrics-jsonl PATH` | unset | NDJSON tick / burst / summary output |
 | `-analyzer-window D` | `20ms` | Bin width for sender-side end-of-run analysis |
+
+### Replica Poisson streams
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-replicas N` | `1` | Model traffic from `N` independent upstream replicas. `-qps` stays the aggregate target and is split equally, so `-qps 300 -replicas 30` runs 30 streams at 10 QPS each (max 10000). |
+
+Superposing independent replica streams stays Poisson-like in aggregate; use
+`-replicas` to model independent sources without changing total mean QPS. The
+end-of-run window analysis still covers the aggregate emitted stream. Combine
+with the burst overlay to layer bursts on top of a replica-fanned base.
 
 ### Takeover mode
 

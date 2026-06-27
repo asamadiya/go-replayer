@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"math"
 	"os"
 	"sort"
 	"strings"
@@ -108,55 +107,7 @@ func dial(target string, tlsEnabled, insecureSkipVerify bool, certFile, keyFile 
 	}
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64*1024*1024)))
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(64*1024*1024)))
-	return grpc.Dial(target, opts...)
-}
-
-// compareFloats parses protobuf responses as raw bytes and computes max absolute difference
-// of all float32 values found at the same offsets. This is a rough heuristic — for a real
-// comparison we'd decode the proto, but for parity checking at 1e-3 this works.
-func compareFloats(a, b []byte, tolerance float64) (match bool, maxDiff float64, totalFloats, mismatchCount int) {
-	if len(a) != len(b) {
-		// Different response sizes — try comparing overlapping float32s
-		minLen := len(a)
-		if len(b) < minLen {
-			minLen = len(b)
-		}
-		// If sizes differ by more than 10%, it's a structural mismatch
-		if float64(abs(len(a)-len(b)))/float64(max(len(a), len(b))) > 0.1 {
-			return false, -1, 0, 0
-		}
-		a = a[:minLen]
-		b = b[:minLen]
-	}
-
-	// Scan for float32 values at every 4-byte aligned offset
-	for i := 0; i+4 <= len(a); i += 4 {
-		bitsA := binary.LittleEndian.Uint32(a[i : i+4])
-		bitsB := binary.LittleEndian.Uint32(b[i : i+4])
-		fA := math.Float32frombits(bitsA)
-		fB := math.Float32frombits(bitsB)
-
-		// Skip NaN/Inf
-		if math.IsNaN(float64(fA)) || math.IsNaN(float64(fB)) || math.IsInf(float64(fA), 0) || math.IsInf(float64(fB), 0) {
-			continue
-		}
-		// Skip values that look like non-float data (e.g., string bytes, field tags)
-		if math.Abs(float64(fA)) > 1e10 || math.Abs(float64(fB)) > 1e10 {
-			continue
-		}
-
-		totalFloats++
-		diff := math.Abs(float64(fA) - float64(fB))
-		if diff > maxDiff {
-			maxDiff = diff
-		}
-		if diff > tolerance {
-			mismatchCount++
-		}
-	}
-
-	match = mismatchCount == 0
-	return
+	return grpc.NewClient(target, opts...)
 }
 
 func abs(x int) int {
@@ -164,13 +115,6 @@ func abs(x int) int {
 		return -x
 	}
 	return x
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func main() {

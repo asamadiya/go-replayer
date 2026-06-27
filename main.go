@@ -312,10 +312,6 @@ func buildDialOptions(useTLS bool, insecureSkip bool, certFile string, keyFile s
 	return opts, nil
 }
 
-func poissonInterval(rate int, rng *rand.Rand) time.Duration {
-	return poissonIntervalFloat(float64(rate), rng)
-}
-
 func poissonIntervalFloat(rate float64, rng *rand.Rand) time.Duration {
 	if rate <= 0 {
 		return 0
@@ -597,9 +593,7 @@ func main() {
 
 	conns := make([]*grpc.ClientConn, *numConns)
 	for i := 0; i < *numConns; i++ {
-		dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		conn, err := grpc.DialContext(dialCtx, *target, opts...)
-		cancel()
+		conn, err := grpc.NewClient(*target, opts...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR connecting (%d/%d): %v\n", i+1, *numConns, err)
 			os.Exit(1)
