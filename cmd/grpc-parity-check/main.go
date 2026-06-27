@@ -43,48 +43,46 @@ type request struct {
 	payload []byte
 }
 
-type parityResult struct {
-	index      int
-	match      bool
-	maxAbsDiff float64
-	aResponse  []byte
-	bResponse  []byte
-	aErr       error
-	bErr       error
-	latencyA   time.Duration
-	latencyB   time.Duration
-}
-
 func loadRequests(path string) ([]request, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	const maxPayloadLen = 256 * 1024 * 1024
 	var reqs []request
 	offset := 0
 	for offset < len(data) {
 		if offset+4 > len(data) {
-			break
+			return nil, fmt.Errorf("truncated method-length prefix at offset %d (record %d)", offset, len(reqs))
 		}
 		methodLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		offset += 4
-		if methodLen <= 0 || methodLen > 1024 || offset+methodLen > len(data) {
-			break
+		if methodLen == 0 || methodLen > 1024 {
+			return nil, fmt.Errorf("invalid method length %d at record %d", methodLen, len(reqs))
+		}
+		if offset+methodLen > len(data) {
+			return nil, fmt.Errorf("truncated method bytes at record %d", len(reqs))
 		}
 		method := string(data[offset : offset+methodLen])
 		offset += methodLen
 		if offset+4 > len(data) {
-			break
+			return nil, fmt.Errorf("truncated payload-length prefix at record %d", len(reqs))
 		}
 		payloadLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		offset += 4
-		if payloadLen < 0 || payloadLen > 20*1024*1024 || offset+payloadLen > len(data) {
-			break
+		if payloadLen > maxPayloadLen {
+			return nil, fmt.Errorf("invalid payload length %d at record %d (max %d)", payloadLen, len(reqs), maxPayloadLen)
+		}
+		if offset+payloadLen > len(data) {
+			return nil, fmt.Errorf("truncated payload at record %d", len(reqs))
 		}
 		payload := make([]byte, payloadLen)
 		copy(payload, data[offset:offset+payloadLen])
 		offset += payloadLen
 		reqs = append(reqs, request{method: method, payload: payload})
+	}
+	if len(reqs) == 0 {
+		return nil, fmt.Errorf("no requests found in %s", path)
 	}
 	return reqs, nil
 }
@@ -140,6 +138,10 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+	if *qps <= 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: --qps must be > 0")
+		os.Exit(1)
+	}
 
 	fmt.Printf("Loading requests from %s...\n", *file)
 	reqs, err := loadRequests(*file)
@@ -188,12 +190,16 @@ func main() {
 		totalByteDiff int64
 		mu            sync.Mutex
 		diffs         []float64
-		results       []parityResult
 	)
 
 	var csvFile *os.File
 	if *outputFile != "" {
-		csvFile, _ = os.Create(*outputFile)
+		csvFile, err = os.Create(*outputFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR creating output file %s: %v\n", *outputFile, err)
+			os.Exit(1)
+		}
+		defer csvFile.Close()
 		fmt.Fprintln(csvFile, "index,match,max_abs_diff,total_floats,mismatch_floats,size_a,size_b,latency_a_ms,latency_b_ms,err_a,err_b")
 	}
 
@@ -246,65 +252,35 @@ func main() {
 
 			atomic.AddInt64(&totalSent, 1)
 
-			pr := parityResult{
-				index:    idx,
-				aErr:     errA,
-				bErr:     errB,
-				latencyA: latA,
-				latencyB: latB,
-			}
-
-			if errA != nil && errB != nil {
+			switch {
+			case errA != nil && errB != nil:
 				atomic.AddInt64(&totalBothErr, 1)
-				pr.match = true // both errored, skip
-			} else if errA != nil {
+			case errA != nil:
 				atomic.AddInt64(&totalErrA, 1)
-				pr.match = false
-			} else if errB != nil {
+			case errB != nil:
 				atomic.AddInt64(&totalErrB, 1)
-				pr.match = false
-			} else {
-				pr.aResponse = respA
-				pr.bResponse = respB
-				if bytes.Equal(respA, respB) {
+			case bytes.Equal(respA, respB):
+				atomic.AddInt64(&totalMatch, 1)
+			default:
+				atomic.AddInt64(&totalByteDiff, 1)
+				match, maxDiff, totalFloats, mismatchCount := compareProtoFloats(respA, respB, *tolerance)
+				if match {
 					atomic.AddInt64(&totalMatch, 1)
-					pr.match = true
-					pr.maxAbsDiff = 0
 				} else {
-					atomic.AddInt64(&totalByteDiff, 1)
-					match, maxDiff, totalFloats, mismatchCount := compareProtoFloats(respA, respB, *tolerance)
-					pr.match = match
-					pr.maxAbsDiff = maxDiff
-					if match {
-						atomic.AddInt64(&totalMatch, 1)
-					} else {
-						atomic.AddInt64(&totalMismatch, 1)
-					}
-
-					mu.Lock()
-					if maxDiff >= 0 {
-						diffs = append(diffs, maxDiff)
-					}
-					mu.Unlock()
-
-					if csvFile != nil {
-						errAStr := ""
-						errBStr := ""
-						mu.Lock()
-						fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,%s,%s\n",
-							idx, match, maxDiff, totalFloats, mismatchCount,
-							len(respA), len(respB),
-							float64(latA.Microseconds())/1000.0,
-							float64(latB.Microseconds())/1000.0,
-							errAStr, errBStr)
-						mu.Unlock()
-					}
+					atomic.AddInt64(&totalMismatch, 1)
 				}
-			}
 
-			mu.Lock()
-			results = append(results, pr)
-			mu.Unlock()
+				mu.Lock()
+				diffs = append(diffs, maxDiff)
+				if csvFile != nil {
+					fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,,\n",
+						idx, match, maxDiff, totalFloats, mismatchCount,
+						len(respA), len(respB),
+						float64(latA.Microseconds())/1000.0,
+						float64(latB.Microseconds())/1000.0)
+				}
+				mu.Unlock()
+			}
 
 			// Progress
 			sent := atomic.LoadInt64(&totalSent)

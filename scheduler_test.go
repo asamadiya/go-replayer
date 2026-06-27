@@ -56,7 +56,7 @@ func TestScheduler_ReplicasSplitRateAndPreserveAggregateQPS(t *testing.T) {
 		t.Fatalf("expected 30 replicas, got %d", s.Replicas())
 	}
 	if s.EffectiveBaseRate() != 300 {
-		t.Fatalf("expected aggregate base rate 300, got %d", s.EffectiveBaseRate())
+		t.Fatalf("expected aggregate base rate 300, got %g", s.EffectiveBaseRate())
 	}
 	if got := s.PerReplicaBaseRate(); got != 10 {
 		t.Fatalf("expected per-replica base rate 10, got %v", got)
@@ -105,7 +105,7 @@ func TestScheduler_DisabledBurstIsNoOp(t *testing.T) {
 		Shape: BurstUniform, Jitter: BurstFixed, Mode: BurstAdditive}
 	s := NewScheduler(50, cfg, start, deadline, rng)
 	if s.EffectiveBaseRate() != 50 {
-		t.Errorf("disabled burst must not reduce base rate, got %d", s.EffectiveBaseRate())
+		t.Errorf("disabled burst must not reduce base rate, got %g", s.EffectiveBaseRate())
 	}
 	_, kinds := drainScheduler(t, s)
 	for _, k := range kinds {
@@ -212,7 +212,7 @@ func TestScheduler_AbsorbingMode_ReducesBaseRate(t *testing.T) {
 	}
 	s := NewScheduler(100, cfg, start, deadline, rng)
 	if s.EffectiveBaseRate() != 70 {
-		t.Errorf("expected base rate 70 (100 - 30), got %d", s.EffectiveBaseRate())
+		t.Errorf("expected base rate 70 (100 - 30), got %g", s.EffectiveBaseRate())
 	}
 	times, kinds := drainScheduler(t, s)
 	var spikes, base int
@@ -248,7 +248,7 @@ func TestScheduler_AbsorbingMode_ZeroFloor(t *testing.T) {
 	}
 	s := NewScheduler(50, cfg, start, deadline, rng)
 	if s.EffectiveBaseRate() != 0 {
-		t.Errorf("expected base rate floored at 0, got %d", s.EffectiveBaseRate())
+		t.Errorf("expected base rate floored at 0, got %g", s.EffectiveBaseRate())
 	}
 }
 

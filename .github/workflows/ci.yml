@@ -29,6 +29,11 @@ jobs:
         run: go build ./...
       - name: Test (race + coverage)
         run: go test -race -coverprofile=coverage.out ./...
+      - name: Enforce coverage floor
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "Total statement coverage: ${total}%"
+          awk -v c="$total" 'BEGIN { if (c+0 < 40.0) { printf "coverage %.1f%% is below the 40%% floor\n", c; exit 1 } }'
 
   lint:
     runs-on: ubuntu-latest

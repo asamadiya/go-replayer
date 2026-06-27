@@ -1,0 +1,92 @@
+package main
+
+import (
+	"encoding/binary"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeParityRec(b *[]byte, method string, payload []byte) {
+	var mlen [4]byte
+	binary.BigEndian.PutUint32(mlen[:], uint32(len(method)))
+	*b = append(*b, mlen[:]...)
+	*b = append(*b, method...)
+	var plen [4]byte
+	binary.BigEndian.PutUint32(plen[:], uint32(len(payload)))
+	*b = append(*b, plen[:]...)
+	*b = append(*b, payload...)
+}
+
+func TestParityLoadRequestsValid(t *testing.T) {
+	var data []byte
+	writeParityRec(&data, "/m1", []byte{1, 2})
+	writeParityRec(&data, "/m2", []byte{3})
+	p := filepath.Join(t.TempDir(), "r.bin")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reqs, err := loadRequests(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(reqs) != 2 || reqs[0].method != "/m1" || reqs[1].method != "/m2" {
+		t.Fatalf("bad parse: %+v", reqs)
+	}
+}
+
+func TestParityLoadRequestsEmptyFileErrors(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "empty.bin")
+	if err := os.WriteFile(p, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRequests(p); err == nil {
+		t.Fatal("empty file must error, not silently report zero requests")
+	}
+}
+
+func TestParityLoadRequestsTruncatedErrors(t *testing.T) {
+	var data []byte
+	writeParityRec(&data, "/m1", []byte{1, 2, 3})
+	data = data[:len(data)-2] // truncate the payload
+	p := filepath.Join(t.TempDir(), "trunc.bin")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRequests(p); err == nil {
+		t.Fatal("truncated file must error")
+	}
+}
+
+func TestParityLoadRequestsRejectsHugeMethodLen(t *testing.T) {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, 0xFFFFFFFF)
+	p := filepath.Join(t.TempDir(), "huge.bin")
+	if err := os.WriteFile(p, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRequests(p); err == nil {
+		t.Fatal("absurd method length must error, not allocate")
+	}
+}
+
+func TestCompareProtoFloatsNoComparableFloatsIsMismatch(t *testing.T) {
+	// Two byte-different messages whose only fields are varints (skipped by the
+	// extractor) yield no comparable floats. This must be reported as a
+	// MISMATCH, never a silent pass.
+	a := fieldVarint(1, 100)
+	b := fieldVarint(1, 200)
+	match, _, total, mismatch := compareProtoFloats(a, b, 1e-6)
+	if match || total != 0 || mismatch == 0 {
+		t.Fatalf("non-float byte difference must mismatch: match=%v total=%d mismatch=%d", match, total, mismatch)
+	}
+}
+
+func TestCompareProtoFloatsUnequalCountsMismatch(t *testing.T) {
+	a := append(fieldFloat64(1, 1.0), fieldFloat64(2, 2.0)...)
+	b := fieldFloat64(1, 1.0)
+	match, _, _, mismatch := compareProtoFloats(a, b, 1e-6)
+	if match || mismatch == 0 {
+		t.Fatalf("unequal float counts must mismatch: match=%v mismatch=%d", match, mismatch)
+	}
+}

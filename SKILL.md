@@ -345,12 +345,13 @@ Capture a real workload by pointing your gRPC client traffic at a collector targ
 ## Testing the replayer itself
 
 ```bash
-go test ./...           # 25 tests: parsers, takeover, scheduler, metrics
+go test ./...           # parsers, takeover, scheduler, metrics, parity
 go test -race ./...     # race detector clean
 go vet ./...            # clean
+golangci-lint run       # lint clean
 ```
 
-Scheduler tests cover exact spike placement, additive vs absorbing rate semantics, deadline correctness, and counter snapshot/drain. Metrics tests cover Fano on periodic vs bursty synthetic streams, NDJSON validity, and nil-receiver safety on the JSONL writer.
+Scheduler tests cover exact spike placement, additive vs absorbing rate semantics (including fractional base rates), replica stream splitting, deadline correctness, and counter snapshot/drain. Metrics tests cover Fano on periodic vs bursty synthetic streams, NDJSON validity, writer error propagation, and nil-receiver safety on the JSONL writer. The parity checker has tests for protobuf float extraction/comparison and strict replay-file parsing.
 
 ## When to use which target
 

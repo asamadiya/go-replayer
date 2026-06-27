@@ -18,10 +18,16 @@ import (
 //
 // This lets a sender prove its own emission shape without relying on a
 // receive-side analyzer.
+// analyzerSampleCap bounds how many dispatch timestamps the analyzer retains
+// so very long or high-QPS runs stay memory-bounded. Beyond the cap, samples
+// are dropped and counted; shape statistics then describe the captured prefix.
+const analyzerSampleCap = 5_000_000
+
 type WindowAnalyzer struct {
 	mu       sync.Mutex
 	tsNanos  []int64
 	windowNs int64
+	dropped  int64
 }
 
 // NewWindowAnalyzer creates an analyzer with the given bin width.
@@ -32,11 +38,22 @@ func NewWindowAnalyzer(window time.Duration) *WindowAnalyzer {
 	}
 }
 
-// Record adds an emitted dispatch timestamp.
+// Record adds an emitted dispatch timestamp, up to analyzerSampleCap.
 func (a *WindowAnalyzer) Record(t time.Time) {
 	a.mu.Lock()
-	a.tsNanos = append(a.tsNanos, t.UnixNano())
+	if len(a.tsNanos) < analyzerSampleCap {
+		a.tsNanos = append(a.tsNanos, t.UnixNano())
+	} else {
+		a.dropped++
+	}
 	a.mu.Unlock()
+}
+
+// Dropped returns how many timestamps were discarded after the cap was hit.
+func (a *WindowAnalyzer) Dropped() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.dropped
 }
 
 // Snapshot returns the underlying timestamps in dispatch order.
@@ -214,9 +231,10 @@ func joinWithSep(parts []string, sep string) string {
 // All writes are guarded by an internal mutex so emitters from multiple
 // goroutines are serialised safely.
 type JSONLWriter struct {
-	mu  sync.Mutex
-	w   io.Writer
-	enc *json.Encoder
+	mu       sync.Mutex
+	w        io.Writer
+	enc      *json.Encoder
+	firstErr error
 }
 
 // NewJSONLWriter wraps w with line-flushing JSON encoding.
@@ -239,14 +257,28 @@ func OpenJSONLWriter(path string) (*JSONLWriter, func() error, error) {
 }
 
 // Emit writes one structured row. Missing writers are no-ops so the
-// caller can stay branch-free.
+// caller can stay branch-free. The first encode/write error is retained and
+// surfaced via Err so the caller can report lost telemetry at shutdown.
 func (j *JSONLWriter) Emit(row map[string]any) {
 	if j == nil {
 		return
 	}
 	j.mu.Lock()
-	_ = j.enc.Encode(row)
+	if err := j.enc.Encode(row); err != nil && j.firstErr == nil {
+		j.firstErr = err
+	}
 	j.mu.Unlock()
+}
+
+// Err returns the first encode/write error encountered, or nil. Safe on a nil
+// writer.
+func (j *JSONLWriter) Err() error {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.firstErr
 }
 
 // EmitTick is the canonical per-second telemetry row.

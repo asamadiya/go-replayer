@@ -124,7 +124,7 @@ func (c BurstConfig) String() string {
 // on Scheduler are accessed via sync/atomic so an observer goroutine can
 // swap-and-read them concurrently for live telemetry.
 type Scheduler struct {
-	baseRate int
+	baseRate float64
 	replicas int
 	burst    BurstConfig
 	deadline time.Time
@@ -189,10 +189,11 @@ func NewSchedulerWithReplicas(targetQPS int, replicas int, cfg BurstConfig, star
 	if replicas < 1 {
 		replicas = 1
 	}
-	base := targetQPS
+	// Keep the base rate in float64 so absorbing mode subtracts the exact
+	// burst average (which can be fractional) without rounding error.
+	base := float64(targetQPS)
 	if cfg.Enabled() && cfg.Mode == BurstAbsorbing {
-		burstQPS := cfg.AvgQPS()
-		base = targetQPS - int(math.Round(burstQPS))
+		base = float64(targetQPS) - cfg.AvgQPS()
 		if base < 0 {
 			base = 0
 		}
@@ -205,7 +206,7 @@ func NewSchedulerWithReplicas(targetQPS int, replicas int, cfg BurstConfig, star
 		rng:      rng,
 	}
 	if base > 0 {
-		perReplicaRate := float64(base) / float64(replicas)
+		perReplicaRate := base / float64(replicas)
 		s.poissonStreams = make([]poissonStream, replicas)
 		for i := range s.poissonStreams {
 			s.poissonStreams[i] = poissonStream{
@@ -227,9 +228,10 @@ func NewSchedulerWithReplicas(targetQPS int, replicas int, cfg BurstConfig, star
 	return s
 }
 
-// EffectiveBaseRate returns the Poisson λ actually used by the scheduler.
-// In absorbing mode this is reduced from the user's --qps.
-func (s *Scheduler) EffectiveBaseRate() int { return s.baseRate }
+// EffectiveBaseRate returns the aggregate Poisson λ actually used by the
+// scheduler. In absorbing mode this is reduced from the user's --qps by the
+// exact burst average (so it may be fractional).
+func (s *Scheduler) EffectiveBaseRate() float64 { return s.baseRate }
 
 // Replicas returns the number of independent Poisson streams.
 func (s *Scheduler) Replicas() int { return s.replicas }
@@ -239,7 +241,7 @@ func (s *Scheduler) PerReplicaBaseRate() float64 {
 	if s.replicas <= 0 {
 		return 0
 	}
-	return float64(s.baseRate) / float64(s.replicas)
+	return s.baseRate / float64(s.replicas)
 }
 
 // Next returns the next scheduled arrival before the deadline.
