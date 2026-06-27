@@ -1,5 +1,8 @@
 # go-replayer
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/asamadiya/go-replayer.svg)](https://pkg.go.dev/github.com/asamadiya/go-replayer)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A high-throughput gRPC replay tool with Poisson pacing, plus local target servers for validation and burstiness diagnostics.
 
 This repo is intended for replay benchmarking, replay pod takeover workflows, and reproducible replay-quality testing (especially tail-latency-sensitive workloads).
@@ -8,16 +11,32 @@ This repo is intended for replay benchmarking, replay pod takeover workflows, an
 
 ```text
 .
-├── main.go                          # go-replayer binary
+├── main.go                          # go-replayer sender binary (entrypoint + flags)
+├── doc.go                           # package documentation
+├── scheduler.go                     # deadline-driven Poisson scheduler + replica streams + burst overlay
+├── metrics.go                       # NDJSON metrics + sender-side window analysis
 ├── main_test.go                     # parser/takeover unit tests
+├── scheduler_test.go                # scheduler + burst + replica tests
+├── metrics_test.go                  # metrics / window-analysis tests
+├── hardening_test.go                # reservoir, absorbing precision, parser-bounds, writer-error tests
 ├── cmd/
 │   ├── grpc-dummy-target/
-│   │   └── main.go                  # lightweight TLS target for replay smoke tests
-│   └── grpc-gap-target/
-│       └── main.go                  # target that measures inter-arrival/burst Poisson fit
+│   │   ├── main.go                  # lightweight TLS target for replay smoke tests
+│   │   └── main_test.go
+│   ├── grpc-gap-target/
+│   │   ├── main.go                  # target that measures inter-arrival/burst Poisson fit
+│   │   └── main_test.go             # quantile / Poisson-tail / window-analysis tests
 │   └── grpc-parity-check/
 │       ├── main.go                  # compares responses from two gRPC targets
-│       └── proto_compare.go         # protobuf float extraction/comparison helpers
+│       ├── proto_compare.go         # protobuf float extraction/comparison helpers
+│       ├── proto_compare_test.go    # comparison-logic tests
+│       └── hardening_test.go        # strict-parser + false-pass-guard tests
+├── ci/ci.yml                        # GitHub Actions workflow (move to .github/workflows/ to enable)
+├── .golangci.yml                    # linter configuration
+├── Makefile                         # build, test, lint, cover targets
+├── CONTRIBUTING.md                  # development guide and quality gates
+├── CHANGELOG.md
+├── SKILL.md                         # operational guide (loadable skill)
 ├── go.mod
 └── go.sum
 ```
@@ -56,6 +75,11 @@ Key behavior:
 | `--analyzer-window D` | Bin width for sender-side window analysis | `20ms` |
 | `--metrics-jsonl PATH` | Write per-second ticks, burst events, and summary as NDJSON | unset |
 
+In `absorbing` mode the base Poisson rate is reduced by the burst average so the
+long-run mean stays at `--qps`. A configuration whose burst average
+(`--burst-size / --burst-period`) exceeds `--qps` cannot be absorbed and is
+rejected at startup.
+
 #### Replica Poisson streams
 
 Use `--replicas R` to model traffic coming from `R` independent upstream replicas (maximum 10000). The sender keeps `--qps` as the aggregate target and splits it equally across replicas, so `--qps 300 --replicas 30` runs 30 independent Poisson streams at 10 QPS each.
@@ -92,7 +116,7 @@ Poisson rate reduced so the long-run mean stays at `--qps`:
 
 - Minimal TLS gRPC target for functional replay validation.
 - Accepts unknown service/method and responds quickly.
-- Optional client-cert requirement for identity verification.
+- Optional client-cert *presentation* requirement (presence-only diagnostic logging; the cert is not trust-verified, so this is not client authentication).
 
 ### 3) Gap target (`cmd/grpc-gap-target`)
 
@@ -104,6 +128,9 @@ Poisson rate reduced so the long-run mean stays at `--qps`:
 
 - Sends the same replayed requests to two targets (`--target-a`, `--target-b`).
 - Compares returned bytes and float values within configurable tolerance.
+- Byte-different responses with no comparable floats (or a differing number of
+  floats) are treated as mismatches, not silent passes.
+- Exits non-zero on any mismatch, and on any RPC error unless `--allow-errors`.
 - Useful for validating batching/no-batching response parity during rollout.
 
 ## Build guide
@@ -128,8 +155,13 @@ Binaries are built locally into `bin/` (git-ignored); the repo ships source only
 ### Run unit tests
 
 ```bash
-go test ./...
+go test ./...          # unit tests
+go test -race ./...    # with the race detector
+make cover             # coverage summary
 ```
+
+A `Makefile` wraps the common loops: `make all` (fmt-check, vet, test, build),
+`make lint`, `make race`, and `make cover`.
 
 ## Development guide
 
@@ -181,3 +213,13 @@ go build ./...
 |---|---|---|---|---|
 | Poisson only, 200 QPS, 10s | 1.156 | 14 | 9 | 0 |
 | `--burst-size 30 --burst-shape spike --burst-period 1s --burst-mode absorbing`, same target QPS | 4.598 | 37 | 32 | 9 |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development loop, quality gates,
+and conventions. In short: branch from `master`, add tests and doc updates, and
+ensure `make all && make lint` is green before opening a PR.
+
+## License
+
+Released under the [MIT License](LICENSE).

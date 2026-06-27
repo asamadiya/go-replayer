@@ -1,13 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"math"
+	"io"
+	"math/rand"
 	"os"
 	"sort"
 	"strings"
@@ -44,48 +46,96 @@ type request struct {
 	payload []byte
 }
 
-type parityResult struct {
-	index      int
-	match      bool
-	maxAbsDiff float64
-	aResponse  []byte
-	bResponse  []byte
-	aErr       error
-	bErr       error
-	latencyA   time.Duration
-	latencyB   time.Duration
+const maxDiffSamples = 1 << 20
+
+// diffSampler keeps an exact count/min/max plus a bounded reservoir (Algorithm
+// R) of float differences so a long / high-QPS parity run reports a
+// distribution without unbounded memory growth. Not safe for concurrent use;
+// callers serialise via their own mutex.
+type diffSampler struct {
+	count     int64
+	min       float64
+	max       float64
+	reservoir []float64
+	rng       *rand.Rand
 }
 
+func newDiffSampler(rng *rand.Rand) *diffSampler {
+	return &diffSampler{reservoir: make([]float64, 0, 1024), rng: rng}
+}
+
+func (d *diffSampler) add(v float64) {
+	if d.count == 0 || v < d.min {
+		d.min = v
+	}
+	if d.count == 0 || v > d.max {
+		d.max = v
+	}
+	d.count++
+	if len(d.reservoir) < maxDiffSamples {
+		d.reservoir = append(d.reservoir, v)
+		return
+	}
+	if j := d.rng.Int63n(d.count); j < int64(len(d.reservoir)) {
+		d.reservoir[j] = v
+	}
+}
+
+// loadRequests reads length-prefixed records from path incrementally (it never
+// buffers the whole raw file), validating each length prefix before allocating
+// and erroring on truncation. The parsed requests are retained in memory so
+// duration looping can replay them; total retained bytes are capped at
+// maxTotalReplayBytes to stay bounded on pathological inputs.
 func loadRequests(path string) ([]request, error) {
-	data, err := os.ReadFile(path)
+	const (
+		maxMethodLen        = 1024
+		maxPayloadLen       = 256 * 1024 * 1024
+		maxTotalReplayBytes = int64(8) << 30 // 8 GiB
+		perRecordOverhead   = 64             // approx retained heap per request
+	)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 1<<20)
+
 	var reqs []request
-	offset := 0
-	for offset < len(data) {
-		if offset+4 > len(data) {
-			break
+	var totalBytes int64
+	for {
+		var methodLen uint32
+		if err := binary.Read(r, binary.BigEndian, &methodLen); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("reading method length at record %d: %w", len(reqs), err)
 		}
-		methodLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
-		offset += 4
-		if methodLen <= 0 || methodLen > 1024 || offset+methodLen > len(data) {
-			break
+		if methodLen == 0 || methodLen > maxMethodLen {
+			return nil, fmt.Errorf("invalid method length %d at record %d", methodLen, len(reqs))
 		}
-		method := string(data[offset : offset+methodLen])
-		offset += methodLen
-		if offset+4 > len(data) {
-			break
+		method := make([]byte, methodLen)
+		if _, err := io.ReadFull(r, method); err != nil {
+			return nil, fmt.Errorf("truncated method bytes at record %d: %w", len(reqs), err)
 		}
-		payloadLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
-		offset += 4
-		if payloadLen < 0 || payloadLen > 20*1024*1024 || offset+payloadLen > len(data) {
-			break
+		var payloadLen uint32
+		if err := binary.Read(r, binary.BigEndian, &payloadLen); err != nil {
+			return nil, fmt.Errorf("reading payload length at record %d: %w", len(reqs), err)
+		}
+		if payloadLen > maxPayloadLen {
+			return nil, fmt.Errorf("invalid payload length %d at record %d (max %d)", payloadLen, len(reqs), maxPayloadLen)
+		}
+		totalBytes += int64(methodLen) + int64(payloadLen) + perRecordOverhead
+		if totalBytes > maxTotalReplayBytes {
+			return nil, fmt.Errorf("replay file exceeds the %d-byte in-memory cap at record %d; use --n or a smaller file", maxTotalReplayBytes, len(reqs))
 		}
 		payload := make([]byte, payloadLen)
-		copy(payload, data[offset:offset+payloadLen])
-		offset += payloadLen
-		reqs = append(reqs, request{method: method, payload: payload})
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, fmt.Errorf("truncated payload at record %d: %w", len(reqs), err)
+		}
+		reqs = append(reqs, request{method: string(method), payload: payload})
+	}
+	if len(reqs) == 0 {
+		return nil, fmt.Errorf("no requests found in %s", path)
 	}
 	return reqs, nil
 }
@@ -108,55 +158,7 @@ func dial(target string, tlsEnabled, insecureSkipVerify bool, certFile, keyFile 
 	}
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64*1024*1024)))
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(64*1024*1024)))
-	return grpc.Dial(target, opts...)
-}
-
-// compareFloats parses protobuf responses as raw bytes and computes max absolute difference
-// of all float32 values found at the same offsets. This is a rough heuristic — for a real
-// comparison we'd decode the proto, but for parity checking at 1e-3 this works.
-func compareFloats(a, b []byte, tolerance float64) (match bool, maxDiff float64, totalFloats, mismatchCount int) {
-	if len(a) != len(b) {
-		// Different response sizes — try comparing overlapping float32s
-		minLen := len(a)
-		if len(b) < minLen {
-			minLen = len(b)
-		}
-		// If sizes differ by more than 10%, it's a structural mismatch
-		if float64(abs(len(a)-len(b)))/float64(max(len(a), len(b))) > 0.1 {
-			return false, -1, 0, 0
-		}
-		a = a[:minLen]
-		b = b[:minLen]
-	}
-
-	// Scan for float32 values at every 4-byte aligned offset
-	for i := 0; i+4 <= len(a); i += 4 {
-		bitsA := binary.LittleEndian.Uint32(a[i : i+4])
-		bitsB := binary.LittleEndian.Uint32(b[i : i+4])
-		fA := math.Float32frombits(bitsA)
-		fB := math.Float32frombits(bitsB)
-
-		// Skip NaN/Inf
-		if math.IsNaN(float64(fA)) || math.IsNaN(float64(fB)) || math.IsInf(float64(fA), 0) || math.IsInf(float64(fB), 0) {
-			continue
-		}
-		// Skip values that look like non-float data (e.g., string bytes, field tags)
-		if math.Abs(float64(fA)) > 1e10 || math.Abs(float64(fB)) > 1e10 {
-			continue
-		}
-
-		totalFloats++
-		diff := math.Abs(float64(fA) - float64(fB))
-		if diff > maxDiff {
-			maxDiff = diff
-		}
-		if diff > tolerance {
-			mismatchCount++
-		}
-	}
-
-	match = mismatchCount == 0
-	return
+	return grpc.NewClient(target, opts...)
 }
 
 func abs(x int) int {
@@ -164,13 +166,6 @@ func abs(x int) int {
 		return -x
 	}
 	return x
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func main() {
@@ -188,12 +183,17 @@ func main() {
 		key          = flag.String("key", "", "Client key path")
 		timeout      = flag.Duration("timeout", 30*time.Second, "Per-request timeout")
 		outputFile   = flag.String("output", "", "Write detailed results to CSV")
+		allowErrors  = flag.Bool("allow-errors", false, "Exit 0 even when some requests returned RPC errors")
 	)
 	flag.Parse()
 
 	if *file == "" || *targetA == "" || *targetB == "" {
 		fmt.Fprintln(os.Stderr, "Usage: grpc-parity-check --file <replay.bin> --target-a <host:port> --target-b <host:port>")
 		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	if *qps <= 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: --qps must be > 0")
 		os.Exit(1)
 	}
 
@@ -235,22 +235,29 @@ func main() {
 
 	interval := time.Second / time.Duration(*qps)
 	var (
-		totalSent     int64
-		totalMatch    int64
-		totalMismatch int64
-		totalErrA     int64
-		totalErrB     int64
-		totalBothErr  int64
-		totalByteDiff int64
-		mu            sync.Mutex
-		diffs         []float64
-		results       []parityResult
+		totalSent          int64
+		totalMatch         int64
+		totalMismatch      int64
+		totalErrA          int64
+		totalErrB          int64
+		totalBothErr       int64
+		totalByteDiff      int64
+		totalByteIdentical int64
+		mu                 sync.Mutex
+		diffs              = newDiffSampler(rand.New(rand.NewSource(time.Now().UnixNano())))
+		csvErr             error // first CSV write/close error (guarded by mu)
 	)
 
 	var csvFile *os.File
 	if *outputFile != "" {
-		csvFile, _ = os.Create(*outputFile)
-		fmt.Fprintln(csvFile, "index,match,max_abs_diff,total_floats,mismatch_floats,size_a,size_b,latency_a_ms,latency_b_ms,err_a,err_b")
+		csvFile, err = os.Create(*outputFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR creating output file %s: %v\n", *outputFile, err)
+			os.Exit(1)
+		}
+		if _, werr := fmt.Fprintln(csvFile, "index,match,max_abs_diff,total_floats,mismatch_floats,size_a,size_b,latency_a_ms,latency_b_ms,err_a,err_b"); werr != nil {
+			csvErr = werr
+		}
 	}
 
 	sem := make(chan struct{}, 32) // concurrency limit
@@ -302,65 +309,38 @@ func main() {
 
 			atomic.AddInt64(&totalSent, 1)
 
-			pr := parityResult{
-				index:    idx,
-				aErr:     errA,
-				bErr:     errB,
-				latencyA: latA,
-				latencyB: latB,
-			}
-
-			if errA != nil && errB != nil {
+			switch {
+			case errA != nil && errB != nil:
 				atomic.AddInt64(&totalBothErr, 1)
-				pr.match = true // both errored, skip
-			} else if errA != nil {
+			case errA != nil:
 				atomic.AddInt64(&totalErrA, 1)
-				pr.match = false
-			} else if errB != nil {
+			case errB != nil:
 				atomic.AddInt64(&totalErrB, 1)
-				pr.match = false
-			} else {
-				pr.aResponse = respA
-				pr.bResponse = respB
-				if bytes.Equal(respA, respB) {
+			case bytes.Equal(respA, respB):
+				atomic.AddInt64(&totalMatch, 1)
+				atomic.AddInt64(&totalByteIdentical, 1)
+			default:
+				atomic.AddInt64(&totalByteDiff, 1)
+				match, maxDiff, totalFloats, mismatchCount := compareProtoFloats(respA, respB, *tolerance)
+				if match {
 					atomic.AddInt64(&totalMatch, 1)
-					pr.match = true
-					pr.maxAbsDiff = 0
 				} else {
-					atomic.AddInt64(&totalByteDiff, 1)
-					match, maxDiff, totalFloats, mismatchCount := compareProtoFloats(respA, respB, *tolerance)
-					pr.match = match
-					pr.maxAbsDiff = maxDiff
-					if match {
-						atomic.AddInt64(&totalMatch, 1)
-					} else {
-						atomic.AddInt64(&totalMismatch, 1)
-					}
+					atomic.AddInt64(&totalMismatch, 1)
+				}
 
-					mu.Lock()
-					if maxDiff >= 0 {
-						diffs = append(diffs, maxDiff)
-					}
-					mu.Unlock()
-
-					if csvFile != nil {
-						errAStr := ""
-						errBStr := ""
-						mu.Lock()
-						fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,%s,%s\n",
-							idx, match, maxDiff, totalFloats, mismatchCount,
-							len(respA), len(respB),
-							float64(latA.Microseconds())/1000.0,
-							float64(latB.Microseconds())/1000.0,
-							errAStr, errBStr)
-						mu.Unlock()
+				mu.Lock()
+				diffs.add(maxDiff)
+				if csvFile != nil {
+					if _, werr := fmt.Fprintf(csvFile, "%d,%v,%.8f,%d,%d,%d,%d,%.1f,%.1f,,\n",
+						idx, match, maxDiff, totalFloats, mismatchCount,
+						len(respA), len(respB),
+						float64(latA.Microseconds())/1000.0,
+						float64(latB.Microseconds())/1000.0); werr != nil && csvErr == nil {
+						csvErr = werr
 					}
 				}
+				mu.Unlock()
 			}
-
-			mu.Lock()
-			results = append(results, pr)
-			mu.Unlock()
 
 			// Progress
 			sent := atomic.LoadInt64(&totalSent)
@@ -392,7 +372,7 @@ func main() {
 	fmt.Printf("  Duration:           %s\n", elapsed.Round(time.Second))
 	fmt.Printf("  Tolerance:          %.0e\n", *tolerance)
 	fmt.Println()
-	fmt.Printf("  Byte-identical:     %d\n", totalMatch-totalByteDiff+atomic.LoadInt64(&totalBothErr))
+	fmt.Printf("  Byte-identical:     %d\n", totalByteIdentical)
 	fmt.Printf("  Float-match:        %d  (within tolerance)\n", totalByteDiff-totalMismatch)
 	fmt.Printf("  MISMATCH:           %d\n", totalMismatch)
 	fmt.Printf("  Errors (A only):    %d\n", totalErrA)
@@ -403,25 +383,49 @@ func main() {
 	parity := float64(totalMatch) / float64(totalSent) * 100
 	fmt.Printf("  PARITY RATE:        %.2f%%  (%d/%d)\n", parity, totalMatch, totalSent)
 
-	if len(diffs) > 0 {
-		sort.Float64s(diffs)
-		n := len(diffs)
+	if diffs.count > 0 {
+		s := append([]float64(nil), diffs.reservoir...)
+		sort.Float64s(s)
+		q := func(p float64) float64 {
+			if len(s) == 0 {
+				return 0
+			}
+			idx := int(p * float64(len(s)))
+			if idx >= len(s) {
+				idx = len(s) - 1
+			}
+			return s[idx]
+		}
 		fmt.Println()
 		fmt.Println("  Float difference distribution (responses with byte differences):")
-		fmt.Printf("    min:    %.8f\n", diffs[0])
-		fmt.Printf("    p50:    %.8f\n", diffs[n/2])
-		fmt.Printf("    p90:    %.8f\n", diffs[int(float64(n)*0.9)])
-		fmt.Printf("    p99:    %.8f\n", diffs[int(float64(n)*0.99)])
-		fmt.Printf("    max:    %.8f\n", diffs[n-1])
+		fmt.Printf("    min:    %.8f\n", diffs.min)
+		fmt.Printf("    p50:    %.8f\n", q(0.50))
+		fmt.Printf("    p90:    %.8f\n", q(0.90))
+		fmt.Printf("    p99:    %.8f\n", q(0.99))
+		fmt.Printf("    max:    %.8f\n", diffs.max)
 	}
 
 	fmt.Println(strings.Repeat("═", 70))
 
-	if totalMismatch > 0 {
+	if csvFile != nil {
+		if cerr := csvFile.Close(); cerr != nil && csvErr == nil {
+			csvErr = cerr
+		}
+	}
+	if csvErr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: CSV output error: %v\n", csvErr)
+	}
+
+	totalErrors := totalErrA + totalErrB + totalBothErr
+	switch {
+	case totalMismatch > 0:
 		fmt.Printf("\n❌ PARITY FAILED: %d mismatches at tolerance %.0e\n", totalMismatch, *tolerance)
 		os.Exit(1)
-	} else {
-		fmt.Printf("\n✅ PARITY PASSED: 100%% match at tolerance %.0e\n", *tolerance)
+	case totalErrors > 0 && !*allowErrors:
+		fmt.Printf("\n❌ PARITY FAILED: %d requests returned RPC errors (pass --allow-errors to ignore)\n", totalErrors)
+		os.Exit(1)
+	default:
+		fmt.Printf("\n✅ PARITY PASSED at tolerance %.0e\n", *tolerance)
 		os.Exit(0)
 	}
 }

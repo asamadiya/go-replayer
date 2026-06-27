@@ -28,7 +28,33 @@ import (
 )
 
 const defaultMethod = "/example.replay.v1.ReplayService/Score"
-const maxReplicas = 10000
+
+const (
+	maxReplicas = 10000
+
+	// Bounds on replay-file length prefixes. A malformed or hostile file
+	// must not be able to force unbounded allocations.
+	maxMethodLen  = 64 * 1024         // 64 KiB — gRPC method paths are short
+	maxPayloadLen = 256 * 1024 * 1024 // 256 MiB per request payload
+
+	// maxLatencySamples bounds the reservoir used for latency percentiles so
+	// arbitrarily long / high-QPS runs stay memory-bounded.
+	maxLatencySamples = 1 << 20 // 1,048,576
+
+	// maxTotalReplayBytes caps the total retained request data so a pathological
+	// or hostile replay file cannot exhaust memory.
+	maxTotalReplayBytes = int64(8) << 30 // 8 GiB
+
+	// perRecordOverhead approximates the retained heap per request (struct +
+	// string/slice headers + allocator overhead) so that a file of many tiny
+	// records is also bounded by maxTotalReplayBytes, not just payload bytes.
+	perRecordOverhead = 64
+
+	// maxDistinctErrors bounds the distinct error-message map so a target that
+	// returns high-cardinality error strings cannot grow memory with the
+	// request count; further distinct messages fold into an "other" counter.
+	maxDistinctErrors = 1024
+)
 
 var (
 	takeoverInstallRootCandidates = []string{
@@ -75,10 +101,61 @@ type dispatchJob struct {
 	method  string
 }
 
-type latencyRecord struct {
-	ts      int64
-	latency float64
-	ok      bool
+// latencyStats accumulates OK-latency statistics with bounded memory:
+// exact count/sum/min/max plus a uniform reservoir sample (Algorithm R) for
+// percentile estimation. Not safe for concurrent use; callers serialise via
+// their own mutex.
+type latencyStats struct {
+	count     int64
+	sum       float64
+	min       float64
+	max       float64
+	reservoir []float64
+	rng       *rand.Rand
+}
+
+func newLatencyStats(rng *rand.Rand) *latencyStats {
+	return &latencyStats{reservoir: make([]float64, 0, 1024), rng: rng}
+}
+
+func (l *latencyStats) add(v float64) {
+	if l.count == 0 || v < l.min {
+		l.min = v
+	}
+	if l.count == 0 || v > l.max {
+		l.max = v
+	}
+	l.count++
+	l.sum += v
+	if len(l.reservoir) < maxLatencySamples {
+		l.reservoir = append(l.reservoir, v)
+		return
+	}
+	if j := l.rng.Int63n(l.count); j < int64(len(l.reservoir)) {
+		l.reservoir[j] = v
+	}
+}
+
+// summary returns min, avg, p50, p90, p99, max, and the exact count. min/avg/max
+// are exact; percentiles are computed from the reservoir (exact when count <=
+// maxLatencySamples, otherwise an unbiased estimate).
+func (l *latencyStats) summary() (lo, avg, p50, p90, p99, hi float64, n int64) {
+	n = l.count
+	if n == 0 {
+		return
+	}
+	lo, hi = l.min, l.max
+	avg = l.sum / float64(n)
+	s := append([]float64(nil), l.reservoir...)
+	sort.Float64s(s)
+	q := func(p float64) float64 {
+		idx := int(p * float64(len(s)))
+		if idx >= len(s) {
+			idx = len(s) - 1
+		}
+		return s[idx]
+	}
+	return lo, avg, q(0.50), q(0.90), q(0.99), hi, n
 }
 
 type takeoverArtifacts struct {
@@ -131,6 +208,9 @@ func loadRequests(path string) ([]request, error) {
 			}
 			return nil, fmt.Errorf("reading method length: %w", err)
 		}
+		if methodLen == 0 || methodLen > maxMethodLen {
+			return nil, fmt.Errorf("invalid method length %d at record %d (must be 1..%d): file is malformed", methodLen, len(reqs), maxMethodLen)
+		}
 		method := make([]byte, methodLen)
 		if _, err := io.ReadFull(f, method); err != nil {
 			return nil, fmt.Errorf("reading method name (%d bytes): %w", methodLen, err)
@@ -139,12 +219,17 @@ func loadRequests(path string) ([]request, error) {
 		if err := binary.Read(f, binary.BigEndian, &payloadLen); err != nil {
 			return nil, fmt.Errorf("reading payload length: %w", err)
 		}
+		if payloadLen > maxPayloadLen {
+			return nil, fmt.Errorf("invalid payload length %d at record %d (max %d): file is malformed", payloadLen, len(reqs), maxPayloadLen)
+		}
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(f, payload); err != nil {
 			return nil, fmt.Errorf("reading request body (%d bytes): %w", payloadLen, err)
 		}
-		recordBytes := int64(8 + methodLen + payloadLen)
-		totalBytes += recordBytes
+		totalBytes += int64(methodLen) + int64(payloadLen) + perRecordOverhead
+		if totalBytes > maxTotalReplayBytes {
+			return nil, fmt.Errorf("replay file exceeds the %d-byte in-memory cap at record %d", maxTotalReplayBytes, len(reqs))
+		}
 
 		methodName := string(method)
 		if err := validateLoadedRequest(methodName, payload); err != nil {
@@ -310,10 +395,6 @@ func buildDialOptions(useTLS bool, insecureSkip bool, certFile string, keyFile s
 	}
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})))
 	return opts, nil
-}
-
-func poissonInterval(rate int, rng *rand.Rand) time.Duration {
-	return poissonIntervalFloat(float64(rate), rng)
 }
 
 func poissonIntervalFloat(rate float64, rng *rand.Rand) time.Duration {
@@ -578,6 +659,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
+	if burstCfg.Mode == BurstAbsorbing && burstCfg.AvgQPS() > float64(*qps) {
+		fmt.Fprintf(os.Stderr,
+			"ERROR: absorbing burst average (%.2f qps = --burst-size/--burst-period) exceeds --qps (%d); "+
+				"increase --qps or --burst-period, or lower --burst-size\n",
+			burstCfg.AvgQPS(), *qps)
+		os.Exit(1)
+	}
 
 	reqs, err := loadRequests(*filePath)
 	if err != nil {
@@ -597,9 +685,7 @@ func main() {
 
 	conns := make([]*grpc.ClientConn, *numConns)
 	for i := 0; i < *numConns; i++ {
-		dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		conn, err := grpc.DialContext(dialCtx, *target, opts...)
-		cancel()
+		conn, err := grpc.NewClient(*target, opts...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR connecting (%d/%d): %v\n", i+1, *numConns, err)
 			os.Exit(1)
@@ -627,6 +713,7 @@ func main() {
 		float64(*qps)/float64(*replicas),
 	)
 
+	latRng := rand.New(rand.NewSource(time.Now().UnixNano() ^ 0x2545f4914f6cdd1d))
 	var (
 		totalSent             int64
 		totalOK               int64
@@ -635,9 +722,9 @@ func main() {
 		secOK                 int64
 		secErr                int64
 		secLatencies          []float64
-		allOKLatencies        []float64
-		allRecords            []latencyRecord
+		okLat                 = newLatencyStats(latRng)
 		errorCounts           = make(map[string]int)
+		otherErrors           int64
 		inflight              int64
 		schedulerBlockedNanos int64
 		schedulerLagNanos     int64
@@ -645,14 +732,16 @@ func main() {
 	)
 
 	var csvFile *os.File
+	var csvErr error // first CSV write/close error (guarded by mu while workers run)
 	if *outputPath != "" {
 		csvFile, err = os.Create(*outputPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR creating output file %s: %v\n", *outputPath, err)
 			os.Exit(1)
 		}
-		defer csvFile.Close()
-		fmt.Fprintln(csvFile, "timestamp_ns,latency_ms,status")
+		if _, werr := fmt.Fprintln(csvFile, "timestamp_ns,latency_ms,status"); werr != nil {
+			csvErr = werr
+		}
 	}
 
 	jsonl, closeJSONL, err := OpenJSONLWriter(*metricsJSONL)
@@ -677,7 +766,7 @@ func main() {
 
 	if burstCfg.Enabled() {
 		fmt.Printf(
-			"Bursts enabled: %s (effective_base_qps=%d replicas=%d per_replica_base_qps=%.3f)\n",
+			"Bursts enabled: %s (effective_base_qps=%.3f replicas=%d per_replica_base_qps=%.3f)\n",
 			burstCfg, scheduler.EffectiveBaseRate(),
 			scheduler.Replicas(),
 			scheduler.PerReplicaBaseRate(),
@@ -820,12 +909,22 @@ func main() {
 				mu.Lock()
 				secLatencies = append(secLatencies, lat)
 				if errSummary != "" {
-					errorCounts[errSummary]++
+					if _, seen := errorCounts[errSummary]; seen || len(errorCounts) < maxDistinctErrors {
+						errorCounts[errSummary]++
+					} else {
+						otherErrors++
+					}
 				} else {
-					allOKLatencies = append(allOKLatencies, lat)
+					okLat.add(lat)
 				}
 				if csvFile != nil {
-					allRecords = append(allRecords, latencyRecord{ts: start.UnixNano(), latency: lat, ok: err == nil})
+					status := "ok"
+					if err != nil {
+						status = "err"
+					}
+					if _, werr := fmt.Fprintf(csvFile, "%d,%.3f,%s\n", start.UnixNano(), lat, status); werr != nil && csvErr == nil {
+						csvErr = werr
+					}
 				}
 				mu.Unlock()
 			}
@@ -866,27 +965,20 @@ func main() {
 	time.Sleep(100 * time.Millisecond)
 
 	if csvFile != nil {
-		mu.Lock()
-		for _, record := range allRecords {
-			status := "ok"
-			if !record.ok {
-				status = "err"
-			}
-			fmt.Fprintf(csvFile, "%d,%.3f,%s\n", record.ts, record.latency, status)
+		if cerr := csvFile.Close(); cerr != nil && csvErr == nil {
+			csvErr = cerr
 		}
-		mu.Unlock()
 	}
 
 	mu.Lock()
-	all := make([]float64, len(allOKLatencies))
-	copy(all, allOKLatencies)
+	latMin, latAvg, latP50, latP90, latP99, latMax, latN := okLat.summary()
 	errSnapshot := make(map[string]int, len(errorCounts))
 	for msg, cnt := range errorCounts {
 		errSnapshot[msg] = cnt
 	}
+	otherErrCount := otherErrors
 	mu.Unlock()
 
-	sort.Float64s(all)
 	elapsed := time.Since(startTime)
 	total := atomic.LoadInt64(&totalSent)
 	ok := atomic.LoadInt64(&totalOK)
@@ -904,15 +996,10 @@ func main() {
 		float64(total)/elapsed.Seconds(),
 		float64(ok)/elapsed.Seconds(),
 	)
-	if len(all) > 0 {
+	if latN > 0 {
 		fmt.Printf(
 			"Latencies (ok only): min=%.1fms avg=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms max=%.1fms\n",
-			all[0],
-			avg(all),
-			all[len(all)*50/100],
-			all[len(all)*90/100],
-			all[len(all)*99/100],
-			all[len(all)-1],
+			latMin, latAvg, latP50, latP90, latP99, latMax,
 		)
 	}
 	if len(errSnapshot) > 0 {
@@ -928,6 +1015,9 @@ func main() {
 		fmt.Println("Top errors:")
 		for _, item := range top {
 			fmt.Printf("  [%d] %s\n", item.cnt, item.msg)
+		}
+		if otherErrCount > 0 {
+			fmt.Printf("  [%d] (other error messages beyond the first %d distinct)\n", otherErrCount, maxDistinctErrors)
 		}
 	}
 
@@ -954,26 +1044,29 @@ func main() {
 		"burst_config":         burstCfg.String(),
 		"window_summary":       windowSummary,
 	}
-	if len(all) > 0 {
+	if latN > 0 {
 		summaryRow["latency_ms"] = map[string]float64{
-			"min": all[0],
-			"avg": avg(all),
-			"p50": all[len(all)*50/100],
-			"p90": all[len(all)*90/100],
-			"p99": all[len(all)*99/100],
-			"max": all[len(all)-1],
+			"min": latMin,
+			"avg": latAvg,
+			"p50": latP50,
+			"p90": latP90,
+			"p99": latP99,
+			"max": latMax,
 		}
 	}
-	jsonl.WriteSummary(summaryRow)
-	fmt.Println("────────────────────────────────────────────────────────────")
-}
-
-func avg(series []float64) float64 {
-	total := 0.0
-	for _, value := range series {
-		total += value
+	if dropped := analyzer.Dropped(); dropped > 0 {
+		fmt.Fprintf(os.Stderr, "WARN: window analyzer dropped %d samples (cap reached); shape stats cover the first %d dispatches\n", dropped, analyzerSampleCap)
 	}
-	return total / float64(len(series))
+	jsonl.WriteSummary(summaryRow)
+	// Check the JSONL writer error AFTER the final summary write so a failure on
+	// that last row is still surfaced.
+	if jerr := jsonl.Err(); jerr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: jsonl metrics writer error: %v\n", jerr)
+	}
+	if csvErr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: CSV output error: %v\n", csvErr)
+	}
+	fmt.Println("────────────────────────────────────────────────────────────")
 }
 
 func maxInt(a int, b int) int {

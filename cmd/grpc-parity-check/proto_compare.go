@@ -42,13 +42,16 @@ func extractTopLevelFloats(data []byte) []float64 {
 				return floats
 			}
 			offset += n
-			if offset+int(length) > len(data) {
+			// Validate against remaining bytes BEFORE converting to int, so a
+			// crafted oversized varint cannot overflow int and bypass the guard.
+			if length > uint64(len(data)-offset) {
 				return floats
 			}
+			end := offset + int(length)
 			// Walk this submessage for float fields (one level only)
-			subFloats := extractShallowFloats(data[offset : offset+int(length)])
+			subFloats := extractShallowFloats(data[offset:end])
 			floats = append(floats, subFloats...)
-			offset += int(length)
+			offset = end
 		case 5: // 32-bit (float)
 			if offset+4 > len(data) {
 				return floats
@@ -102,6 +105,9 @@ func extractShallowFloats(data []byte) []float64 {
 				return floats
 			}
 			offset += n
+			if length > uint64(len(data)-offset) {
+				return floats
+			}
 			offset += int(length)
 		case 5: // float
 			if offset+4 > len(data) {
@@ -134,21 +140,21 @@ func decodeVarint(data []byte) (uint64, int) {
 	return 0, 0
 }
 
+// compareProtoFloats decides whether two responses are equivalent within
+// tolerance. It is intended to be called only when the raw response bytes
+// already differ: if the difference cannot be attributed to comparable float
+// fields — no floats on either side, or a differing number of floats — the
+// responses are treated as a MISMATCH rather than silently passing.
 func compareProtoFloats(a, b []byte, tolerance float64) (match bool, maxDiff float64, totalFloats, mismatchCount int) {
 	floatsA := extractTopLevelFloats(a)
 	floatsB := extractTopLevelFloats(b)
 
-	if len(floatsA) != len(floatsB) {
-		// Different number of float values - try comparing the shorter set
-		minLen := len(floatsA)
-		if len(floatsB) < minLen {
-			minLen = len(floatsB)
+	if len(floatsA) == 0 || len(floatsB) == 0 || len(floatsA) != len(floatsB) {
+		totalFloats = len(floatsA)
+		if len(floatsB) < totalFloats {
+			totalFloats = len(floatsB)
 		}
-		if minLen == 0 {
-			return len(floatsA) == len(floatsB), -1, 0, 0
-		}
-		totalFloats = minLen
-		for i := 0; i < minLen; i++ {
+		for i := 0; i < totalFloats; i++ {
 			diff := math.Abs(floatsA[i] - floatsB[i])
 			if diff > maxDiff {
 				maxDiff = diff
@@ -157,10 +163,12 @@ func compareProtoFloats(a, b []byte, tolerance float64) (match bool, maxDiff flo
 				mismatchCount++
 			}
 		}
-		// Count the length difference as mismatches too
 		mismatchCount += abs(len(floatsA) - len(floatsB))
-		match = mismatchCount == 0
-		return
+		if mismatchCount == 0 {
+			// Bytes differ but no comparable floats explain it.
+			mismatchCount = 1
+		}
+		return false, maxDiff, totalFloats, mismatchCount
 	}
 
 	totalFloats = len(floatsA)
