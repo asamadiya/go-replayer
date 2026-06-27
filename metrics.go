@@ -21,7 +21,12 @@ import (
 // analyzerSampleCap bounds how many dispatch timestamps the analyzer retains
 // so very long or high-QPS runs stay memory-bounded. Beyond the cap, samples
 // are dropped and counted; shape statistics then describe the captured prefix.
-const analyzerSampleCap = 5_000_000
+const (
+	analyzerSampleCap = 5_000_000
+	// maxSummaryBins bounds the per-window histogram allocation in Summary so a
+	// tiny --analyzer-window over a long run cannot allocate without limit.
+	maxSummaryBins = 5_000_000
+)
 
 type WindowAnalyzer struct {
 	mu       sync.Mutex
@@ -103,6 +108,12 @@ func (a *WindowAnalyzer) Summary(window time.Duration, thresholds []int) WindowS
 	numBins := int((last-first)/winNs) + 1
 	if numBins < 1 {
 		numBins = 1
+	}
+	if numBins > maxSummaryBins {
+		// A tiny analyzer window over a long run would otherwise allocate an
+		// unbounded histogram. Clamp the bin count; out-of-range samples fold
+		// into the last bin (handled by the idx clamp below).
+		numBins = maxSummaryBins
 	}
 	counts := make([]int, numBins)
 	for _, t := range ts {

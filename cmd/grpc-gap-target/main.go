@@ -239,7 +239,7 @@ func main() {
 	addr := flag.String("addr", ":28826", "listen address")
 	cert := flag.String("cert", "", "server cert")
 	key := flag.String("key", "", "server key")
-	requireClientCert := flag.Bool("require-client-cert", false, "require clients to present a TLS cert")
+	requireClientCert := flag.Bool("require-client-cert", false, "require clients to present a TLS cert (presentation only; the cert is NOT trust-verified — this is a diagnostic target)")
 	flag.Parse()
 
 	if *cert == "" || *key == "" {
@@ -252,6 +252,8 @@ func main() {
 	}
 	tlsCfg := &tls.Config{Certificates: []tls.Certificate{serverCert}}
 	if *requireClientCert {
+		// Presentation only — the client cert is not verified against a CA.
+		// This target is a diagnostic stand-in, not an authenticating server.
 		tlsCfg.ClientAuth = tls.RequireAnyClientCert
 	}
 

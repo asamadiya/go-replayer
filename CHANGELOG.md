@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Replaced unbounded per-request latency and CSV buffers with streaming CSV
   writes and a bounded reservoir sample, and capped the window analyzer's
-  retained timestamps, so long / high-QPS runs stay memory-bounded.
+  retained timestamps and per-window histogram, so long / high-QPS runs stay
+  memory-bounded.
 - Migrated deprecated `grpc.Dial`/`grpc.DialContext` to `grpc.NewClient`.
 
 ## [0.2.0]
