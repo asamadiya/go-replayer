@@ -1,3 +1,7 @@
+# GitHub Actions workflow for go-replayer.
+# Not active here: GitHub only runs workflows under .github/workflows/. To enable
+# CI, move this file there with a token that has the `workflow` scope:
+#   git mv ci/ci.yml .github/workflows/ci.yml && git commit && git push
 name: CI
 
 on:

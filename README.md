@@ -1,6 +1,5 @@
 # go-replayer
 
-[![CI](https://github.com/asamadiya/go-replayer/actions/workflows/ci.yml/badge.svg)](https://github.com/asamadiya/go-replayer/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/asamadiya/go-replayer.svg)](https://pkg.go.dev/github.com/asamadiya/go-replayer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -32,7 +31,7 @@ This repo is intended for replay benchmarking, replay pod takeover workflows, an
 │       ├── proto_compare.go         # protobuf float extraction/comparison helpers
 │       ├── proto_compare_test.go    # comparison-logic tests
 │       └── hardening_test.go        # strict-parser + false-pass-guard tests
-├── .github/workflows/ci.yml         # build / vet / fmt / race-test / lint / coverage floor
+├── ci/ci.yml                        # GitHub Actions workflow (move to .github/workflows/ to enable)
 ├── .golangci.yml                    # linter configuration
 ├── Makefile                         # build, test, lint, cover targets
 ├── CONTRIBUTING.md                  # development guide and quality gates

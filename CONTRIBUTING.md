@@ -26,7 +26,9 @@ the quickest way to reproduce CI before pushing.
 
 ## Quality gates
 
-Every pull request must pass the [CI workflow](.github/workflows/ci.yml):
+Run the full local gate before pushing. The same checks are defined as a
+GitHub Actions workflow in [`ci/ci.yml`](ci/ci.yml) — move it to
+`.github/workflows/` (with a token that has the `workflow` scope) to enable CI:
 
 1. **Formatting** — `gofmt -l .` must be empty.
 2. **Vet** — `go vet ./...` clean.
@@ -36,9 +38,9 @@ Every pull request must pass the [CI workflow](.github/workflows/ci.yml):
 
 New behavior should ship with tests. Pure logic (parsing, scheduling, metrics,
 proto comparison) is unit-tested directly; the network target servers under
-`cmd/` are validated through the workflows documented in `SKILL.md`. CI enforces
-a total statement-coverage floor of 40% (`go tool cover -func`), so substantial
-new code must come with tests.
+`cmd/` are validated through the workflows documented in `SKILL.md`. The gate
+enforces a total statement-coverage floor of 40% (`go tool cover -func`), so
+substantial new code must come with tests.
 
 ## Conventions
 
