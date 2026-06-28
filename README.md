@@ -95,10 +95,10 @@ The end-of-run sender-side window analysis remains over the aggregate emitted st
 
 Representative 60s simulation at 300 aggregate QPS with 20ms analysis bins:
 
-| Run | Per-replica QPS | Fano | max/bin | p99 bin count | bins ≥14 | bins ≥16 |
+| Run | Per-replica QPS | Fano | max/bin | p99 bin count | bins ≥12 | bins ≥30 |
 |---|---:|---:|---:|---:|---:|---:|
 | `--replicas 1` | 300.0 | 0.997 | 15 | 12 | 6 | 0 |
-| `--replicas 30` | 10.0 | 1.017 | 16 | 12 | 11 | 3 |
+| `--replicas 30` | 10.0 | 1.017 | 16 | 12 | 11 | 0 |
 
 Example: 30-request spike packed into a 20ms window every 1s, with the base
 Poisson rate reduced so the long-run mean stays at `--qps`:

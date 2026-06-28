@@ -339,7 +339,7 @@ Capture a real workload by pointing your gRPC client traffic at a collector targ
 3. **Drift is per-second, not cumulative.** A burst dumping 30 requests inside a 20ms window usually appears as `drift=+15..+30` in the second the burst lands, then `drift=-` of similar magnitude the following second under absorbing mode. This is by design; the long-run mean is preserved.
 4. **`-target` accepts tuple forms.** `(host,port)`, `["host","port"]`, and bracketed IPv6 all normalise to `host:port`. Useful when pasting from log lines.
 5. **Takeover mode forces TLS.** `-tls=false` is ignored under `-take-over-replay`; the deployment's identity cert is mandatory.
-6. **The replayer reads the entire replay file into memory.** A 10GiB file is fine on a takeover pod with 64GiB RAM, but watch RSS on smaller workstations. Records with zero-length payloads are skipped at load time and counted in the `Skipped N invalid requests` line.
+6. **The replayer retains all parsed requests in memory, capped at 8 GiB.** `loadRequests` accumulates method+payload bytes plus a 64-byte per-record overhead and aborts with `replay file exceeds the …-byte in-memory cap` once the total exceeds `maxTotalReplayBytes` (8 GiB). A ~7GiB file is fine on a 64GiB takeover pod, but a 10GiB file is rejected at load time. Records with zero-length payloads are skipped at load time and counted in the `Skipped N invalid requests` line.
 7. **`grpc-gap-target` only prints summary on signal.** Send `SIGTERM` (or `SIGINT`) to flush the arrival summary to stdout. Killing it with `SIGKILL` loses the summary.
 8. **Sender-side window analysis can disagree slightly with receive-side.** The sender records the dispatch time *before* the worker pool grabs the job; the network adds queueing. Differences <5% are normal; >20% indicates real wire-side queueing or scheduler lag — investigate `sched_block` and `sched_lag` columns.
 9. **Race detector mode is supported.** `go test -race ./...` passes; counters use `sync/atomic` and the JSONL writer guards encoding with a mutex.
@@ -354,7 +354,7 @@ go vet ./...            # clean
 golangci-lint run       # lint clean
 ```
 
-Scheduler tests cover exact spike placement, additive vs absorbing rate semantics (including fractional base rates), replica stream splitting, deadline correctness, and counter snapshot/drain. Metrics tests cover Fano on periodic vs bursty synthetic streams, NDJSON validity, writer error propagation, and nil-receiver safety on the JSONL writer. The parity checker has tests for protobuf float extraction/comparison and strict replay-file parsing.
+Scheduler tests cover exact spike placement, additive vs absorbing rate semantics (including fractional base rates), replica stream splitting, deadline correctness, and counter snapshot/drain. Metrics tests cover Fano on periodic vs bursty synthetic streams, NDJSON validity, writer error propagation, and nil-receiver safety on the JSONL writer. The parity checker has tests for protobuf float extraction/comparison, the bounded diff reservoir, no-comparable-floats / unequal-count mismatch handling, and strict replay-file parsing (including huge-method-length rejection and truncation).
 
 ## When to use which target
 
